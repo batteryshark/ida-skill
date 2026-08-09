@@ -1,8 +1,8 @@
 # IDA Skill
 
-IDA Skill is a Codex-compatible skill and local bridge that lets coding agents
-and reverse engineers drive a licensed IDA Pro 9.x installation through
-persistent headless workers.
+IDA Skill is an agent skill and local bridge that lets coding agents and reverse
+engineers drive a licensed IDA Pro 9.x installation through persistent headless
+workers.
 
 Each binary gets its own local worker. The worker opens the database once,
 accepts concurrent CLI or MCP clients, saves changes periodically, and exits
@@ -67,30 +67,17 @@ The CLI can also auto-start a missing worker on first use.
 
 ## Agent integration
 
-`SKILL.md` is the canonical agent and operating guide. For Codex, clone the
-repository into the skills directory:
-
-```bash
-# macOS / Linux
-git clone https://github.com/batteryshark/ida-skill.git \
-  "${CODEX_HOME:-$HOME/.codex}/skills/ida-skill"
-```
-
-```powershell
-# Windows PowerShell
-git clone https://github.com/batteryshark/ida-skill.git `
-  "$env:USERPROFILE\.codex\skills\ida-skill"
-```
-
-`agents/openai.yaml` supplies Codex UI metadata. The CLI and MCP entry points
-also work directly when an agent does not load skills.
+`SKILL.md` is the canonical agent and operating guide. Point a compatible skill
+loader at this checkout, or connect through the MCP server. The skill works with
+Claude Code, OpenCode, Codex, and other clients that support `SKILL.md` or MCP.
+The CLI also works without an agent framework.
 
 ## Repository map
 
 | Path | Purpose |
 | --- | --- |
 | `SKILL.md` | Canonical agent instructions and operating guide |
-| `agents/openai.yaml` | Codex UI metadata |
+| `agents/openai.yaml` | Optional OpenAI client UI metadata |
 | `scripts/setup.mjs` | Copy a private runtime from a licensed IDA installation |
 | `scripts/bridge.mjs` | Start, stop, and inspect persistent workers |
 | `scripts/worker.py` | Headless idalib TCP worker |
