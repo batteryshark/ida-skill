@@ -1,0 +1,9 @@
+Third-party notices
+
+Portions of the IDA handler and helper layer are adapted from re-mcp:
+https://github.com/jtsylve/re-mcp
+
+Copyright (c) 2026 Joe T. Sylve, Ph.D.
+
+re-mcp offers those portions under MIT OR Apache-2.0. This distribution uses
+the MIT option reproduced in LICENSE.
