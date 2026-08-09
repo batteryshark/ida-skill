@@ -120,6 +120,14 @@ test('full mode copies installation content and private license state', () => {
       readFileSync(join(bundle, 'ida-runtime-linux', 'docs', 'guide.txt'), 'utf8'),
       'full-mode-fixture',
     );
+    assert.equal(
+      readFileSync(join(bundle, 'ida-runtime-linux', 'license', 'idapro.hexlic'), 'utf8'),
+      'private-license-fixture',
+    );
+    assert.equal(
+      readFileSync(join(bundle, 'ida-runtime-linux', 'license', 'ida.reg'), 'utf8'),
+      'eula-fixture',
+    );
   } finally {
     rmSync(temp, { recursive: true, force: true });
   }

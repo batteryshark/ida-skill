@@ -4,8 +4,8 @@ Every ``*.py`` in this package that defines a module-level ``COMMANDS`` list
 (of :class:`ida_cmd.Command`) is discovered and flattened into a single
 registry. Because handler modules keep their ``ida_*`` imports inside function
 bodies, importing this package (and therefore ``REGISTRY``) requires **no** IDA
-runtime — that is what lets ``cli.py`` and ``mcp.py`` introspect the full
-command surface anywhere.
+runtime — that is what lets ``cli.py`` and ``mcp_server.py`` introspect the
+full command surface anywhere.
 
 Public API:
   * ``REGISTRY``   — dict[str, Command] keyed by name and alias

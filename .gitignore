@@ -25,5 +25,3 @@ __pycache__/
 *.py[cod]
 .venv/
 IDA Professional */
-idalab-backup/
-INVESTIGATION.md

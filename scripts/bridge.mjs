@@ -2,10 +2,8 @@
 // bridge.mjs
 // Manages the idalib worker process lifecycle: start, stop, status.
 //
-// The worker is a persistent Python process that loads idalib once and
-// serves sub-millisecond queries over localhost TCP. This is fundamentally
-// better than the Ghidra bridge: ~1s Python startup (vs ~15s JVM) and
-// in-process query latency (vs TCP-to-JVM).
+// The worker is a persistent Python process that loads idalib once and serves
+// commands over localhost TCP without reopening the database for every query.
 //
 // Usage:
 //   node bridge.mjs start   --binary <path> [--run-auto-analysis] [--idle <sec>] [--timeout <sec>]
