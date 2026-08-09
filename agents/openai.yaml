@@ -1,0 +1,4 @@
+interface:
+  display_name: "IDA Pro Reverse Engineering"
+  short_description: "Headless IDA analysis with shared workers"
+  default_prompt: "Use $ida-skill to analyze this binary with the provisioned IDA runtime."
