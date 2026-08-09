@@ -1,0 +1,29 @@
+# Proprietary IDA payloads and local worker state. Never commit these.
+/bin/
+*.hexlic
+ida.reg
+ida-config.json
+*.dylib
+*.dll
+*.so
+*.pyd
+*.exe
+*.til
+
+# IDA databases and generated analysis state.
+*.i64
+*.idb
+*.id0
+*.id1
+*.id2
+*.nam
+*.bak
+
+# Local development artifacts.
+.DS_Store
+__pycache__/
+*.py[cod]
+.venv/
+IDA Professional */
+idalab-backup/
+INVESTIGATION.md
