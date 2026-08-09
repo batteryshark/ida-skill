@@ -5,27 +5,27 @@ Auto-generated from the command manifest by `scripts/gen_reference.py`. **291 co
 This is a compact map (name + one-line summary). For a command's exact parameters, ask the CLI directly — it is the authoritative, always-current source:
 
 ```bash
-python scripts/cli.py <command> --help          # exact params for one command
-python scripts/cli.py commands --category debug  # filtered live listing
-python scripts/cli.py <command> [args] --binary <path>
-python scripts/cli.py call <command> key=value ... --binary <path>  # passthrough
+python3 scripts/cli.py <command> --help          # exact params for one command
+python3 scripts/cli.py commands --category debug  # filtered live listing
+python3 scripts/cli.py <command> [args] --binary <path>
+python3 scripts/cli.py call <command> key=value ... --binary <path>  # passthrough
 ```
 `*` marks commands that modify the database.
 
 ## Categories
 
 - [Lifecycle (worker built-ins)](#lifecycle-worker-built-ins) — 4
-- [Database & metadata](#database-&-metadata) — 9
+- [Database & metadata](#database--metadata) — 9
 - [Functions](#functions) — 7
 - [Cross-references](#cross-references) — 3
-- [Search & strings](#search-&-strings) — 6
-- [Data & segments (read)](#data-&-segments-read) — 3
+- [Search & strings](#search--strings) — 6
+- [Data & segments (read)](#data--segments-read) — 3
 - [Imports / exports / entry points](#imports--exports--entry-points) — 5
-- [Instructions & operands](#instructions-&-operands) — 3
+- [Instructions & operands](#instructions--operands) — 3
 - [Control flow](#control-flow) — 2
 - [Stack frames](#stack-frames) — 2
 - [Decompiler AST (ctree)](#decompiler-ast-ctree) — 3
-- [Decompiler variables & comments](#decompiler-variables-&-comments) — 6
+- [Decompiler variables & comments](#decompiler-variables--comments) — 6
 - [Comments](#comments) — 5
 - [Names / labels](#names--labels) — 2
 - [Demangling](#demangling) — 3
@@ -50,7 +50,7 @@ python scripts/cli.py call <command> key=value ... --binary <path>  # passthroug
 - [Switch tables](#switch-tables) — 2
 - [Register tracking](#register-tracking) — 2
 - [Register variables](#register-variables) — 6
-- [Signatures & type libraries](#signatures-&-type-libraries) — 5
+- [Signatures & type libraries](#signatures--type-libraries) — 5
 - [Signature generation](#signature-generation) — 1
 - [Source language](#source-language) — 2
 - [Batch export](#batch-export) — 4

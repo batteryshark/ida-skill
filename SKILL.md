@@ -24,7 +24,8 @@ runtime.
 
 Install Node.js 22+ (Node 24 LTS recommended) and the CPython major/minor ABI
 required by your IDA build (for example, CPython 3.13 for IDA 9.4). Then copy
-from your own installation:
+from your own installation. Install `uv` only if you plan to use the optional
+MCP server.
 
 ```bash
 # macOS
@@ -126,10 +127,10 @@ notice) because JSON is far more verbose for the same information. The
 `IDA_SKILL_ALLOW_JSON=1` escape hatch exists solely for scripts that must
 parse the output programmatically.
 
-**~300 commands** are available — full parity with the `re-mcp-ida` MCP server
-plus its complete headless debugger. They are auto-discovered from
-`scripts/handlers/` and every one is a first-class CLI subcommand with its own
-`--help`. Three ways to discover and invoke:
+The generated catalog currently contains 291 commands, including 106 debugger
+commands. They are auto-discovered from `scripts/handlers/`, and every command
+is a first-class CLI subcommand with its own `--help`. Three ways to discover
+and invoke them:
 
 ```bash
 # 1. Browse the catalog (optionally by category)
@@ -186,8 +187,17 @@ Each command is a plain handler in `scripts/handlers/<domain>.py` that takes an
 `args` dict and returns JSON. Handlers keep their `ida_*` imports *inside*
 functions, so the command manifest (`ida_cmd.Command`/`Param`) imports without a
 running IDA — that single manifest drives the CLI, the MCP server
-(`scripts/mcp.py`), and the generated reference. To add a command, add a handler
-+ a `Command(...)` entry; it appears everywhere automatically.
+(`scripts/mcp_server.py`), and the generated reference. To add a command, add a
+handler + a `Command(...)` entry; it appears everywhere automatically.
+
+### MCP server (optional)
+
+After starting a worker, expose the same command manifest over MCP:
+
+```bash
+uv run scripts/mcp_server.py --binary /path/to/binary
+# Or connect directly: uv run scripts/mcp_server.py --port 62927
+```
 
 ## Stop the worker
 
@@ -219,20 +229,20 @@ bridge.mjs stop --binary /path/bin
   → SIGTERM → worker saves database, exits
 ```
 
-**Why this is fast:** idalib loads as native code via ctypes (no JVM). The
-worker process keeps the database open in memory. Queries execute in-process
-at native speed — sub-millisecond for most operations.
+The worker keeps the database open in memory, avoiding IDA startup and database
+load costs between commands. Command time still depends on the operation and
+database size.
 
 **Single-database constraint:** idalib holds one database per process. Each
 binary gets its own worker. Multiple agents can share one worker (commands
-serialized, each <1ms).
+are serialized on IDA's main thread).
 
 ## Multiple agents, one worker
 
-Concurrent clients on the same worker are fully supported: requests are
-queued FIFO onto IDA's main thread, and each request carries its own result
-slot, so responses can never be cross-delivered. The idle shutdown never
-fires while a request is in flight or queued.
+The worker accepts concurrent clients: requests are queued FIFO onto IDA's main
+thread, and each request carries its own result slot so responses cannot be
+cross-delivered. Idle shutdown does not fire while a request is in flight or
+queued.
 
 For orchestrated fan-out, start the worker with `--multi-agent`. This blocks
 `undo`, `redo`, and `restore-snapshot` (they roll back *global* database

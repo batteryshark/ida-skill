@@ -394,7 +394,7 @@ def _enforce_text_output(ns) -> None:
 
     The compact text format is the canonical, token-efficient view for agents;
     JSON is verbose and gated behind IDA_SKILL_ALLOW_JSON=1 for the rare
-    programmatic pipeline that parses the output (e.g. rekit_run.py).
+    programmatic pipeline that parses the output.
     """
     if os.environ.get("IDA_SKILL_ALLOW_JSON"):
         return

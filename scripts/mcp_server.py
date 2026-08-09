@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
-# /// script, requires-python = ">=3.12"
-# /// dependencies = ["fastmcp>=2.0,<3"]
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["fastmcp>=2.0,<3"]
 # ///
-"""mcp.py — MCP server mode for the idalib worker (manifest-driven).
+"""mcp_server.py — MCP server mode for the idalib worker (manifest-driven).
 
 Generates one MCP tool per worker command from the shared manifest in
 ``handlers/`` + ``ida_cmd.py``, so the MCP surface stays in lock-step with the
 CLI automatically — no hand-written wrappers to drift.
 
 Usage (with uv):
-  uv run scripts/mcp.py --binary /path/to/binary
-  uv run scripts/mcp.py --port 62927
+  uv run scripts/mcp_server.py --binary /path/to/binary
+  uv run scripts/mcp_server.py --port 62927
 
 Harness config (Claude Code, Cursor):
   {
     "mcpServers": {
       "ida": {
         "command": "uv",
-        "args": ["run", "/path/to/ida-skill/scripts/mcp.py", "--binary", "/path/to/bin"]
+        "args": ["run", "/path/to/ida-skill/scripts/mcp_server.py", "--binary", "/path/to/bin"]
       }
     }
   }
@@ -52,8 +53,9 @@ _worker_binary: str | None = None
 # Worker connection
 # ─────────────────────────────────────────────────────────────────────────────
 def resolve_port(binary: str | None = None, port: int | None = None) -> int:
-    if port:
-        return port
+    selected_port = port if port is not None else _worker_port
+    if selected_port is not None:
+        return selected_port
     if binary is None:
         binary = _worker_binary
     if binary is None:
@@ -113,6 +115,7 @@ _BUILTIN_SPECS = [
     Command("close", None, "lifecycle", "Close the current database.",
             params=[Param("save", "bool", default=True, help="Save before closing.")]),
     Command("save", None, "lifecycle", "Flush the database to disk."),
+    Command("list-commands", None, "lifecycle", "List all commands (worker-side)."),
 ]
 
 
@@ -161,6 +164,9 @@ def register_all():
 @mcp.tool()
 def bridge_status() -> str:
     """Check if the worker is running and get database info."""
+    if _worker_binary is None and _worker_port is not None:
+        return json.dumps(send_command(_worker_port, "info", {}), indent=2, default=str)
+
     import subprocess
 
     result = subprocess.run(

@@ -10,6 +10,7 @@ Writes ../references/commands.md.
 """
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -75,6 +76,12 @@ CATEGORY_TITLES = {
 
 CATEGORY_ORDER = list(CATEGORY_TITLES.keys())
 
+
+def github_anchor(title: str) -> str:
+    """Return the fragment GitHub assigns to a simple Markdown heading."""
+    return re.sub(r"[^\w -]", "", title.lower()).replace(" ", "-")
+
+
 # The four lifecycle built-ins are defined in the worker, not in a handler
 # module — include them here so the catalog is complete.
 LIFECYCLE = [
@@ -106,10 +113,10 @@ def main() -> None:
                  "command's exact parameters, ask the CLI directly — it is the "
                  "authoritative, always-current source:\n")
     lines.append("```bash")
-    lines.append("python scripts/cli.py <command> --help          # exact params for one command")
-    lines.append("python scripts/cli.py commands --category debug  # filtered live listing")
-    lines.append("python scripts/cli.py <command> [args] --binary <path>")
-    lines.append("python scripts/cli.py call <command> key=value ... --binary <path>  # passthrough")
+    lines.append("python3 scripts/cli.py <command> --help          # exact params for one command")
+    lines.append("python3 scripts/cli.py commands --category debug  # filtered live listing")
+    lines.append("python3 scripts/cli.py <command> [args] --binary <path>")
+    lines.append("python3 scripts/cli.py call <command> key=value ... --binary <path>  # passthrough")
     lines.append("```")
     lines.append("`*` marks commands that modify the database.\n")
 
@@ -120,7 +127,7 @@ def main() -> None:
     lines.append("## Categories\n")
     for cat in ordered:
         title = CATEGORY_TITLES.get(cat, cat)
-        anchor = title.lower().replace(" ", "-").replace("(", "").replace(")", "").replace("/", "")
+        anchor = github_anchor(title)
         lines.append(f"- [{title}](#{anchor}) — {len(by_cat[cat])}")
     lines.append("")
 
