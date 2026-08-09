@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // setup.mjs
 // Provisions a minimal portable idalib runtime from the user's licensed
-// IDA Pro installation. Pure Node.js stdlib (Node >= 18). No npm deps.
+// IDA Pro installation. Pure Node.js stdlib (Node >= 22). No npm deps.
 //
 // IDA is proprietary: copy only from the user's local installation into an
 // ignored private bundle. Never modify the source installation or download IDA.

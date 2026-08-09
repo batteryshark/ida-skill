@@ -22,8 +22,9 @@ installation, a license file, EULA state, or dbgsrv binaries. Confirm that your
 Hex-Rays agreement permits every machine and location where you use a copied
 runtime.
 
-Install Node.js 18+ and the CPython major/minor ABI required by your IDA build
-(for example, CPython 3.13 for IDA 9.4). Then copy from your own installation:
+Install Node.js 22+ (Node 24 LTS recommended) and the CPython major/minor ABI
+required by your IDA build (for example, CPython 3.13 for IDA 9.4). Then copy
+from your own installation:
 
 ```bash
 # macOS
