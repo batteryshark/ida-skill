@@ -17,6 +17,7 @@ for the full catalog, or read ``references/*.md``.
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import queue
@@ -25,6 +26,7 @@ import socketserver
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -54,12 +56,10 @@ def _host_platform() -> str:
     return "linux"
 
 
-DEFAULT_BIN_DIR = Path(
-    os.environ.get("IDA_SKILL_BIN_DIR", SCRIPT_DIR.parent / "bin")
-).expanduser().resolve()
-RUNTIME_DIR = Path(
-    os.environ.get("IDA_RUNTIME_DIR", DEFAULT_BIN_DIR / f"ida-runtime-{_host_platform()}")
-).expanduser().resolve()
+RUNTIME_DIR = Path(os.environ.get(
+    "IDA_RUNTIME_DIR",
+    SCRIPT_DIR.parent / "bin" / f"ida-runtime-{_host_platform()}",
+))
 
 
 def _setup_environment():
@@ -94,11 +94,11 @@ def _setup_environment():
         if os.path.isdir(p) and p not in sys.path:
             sys.path.insert(0, p)
 
-    if sys.platform == "win32" and has_license:
-        _register_windows_license()
+    if sys.platform == "win32":
+        _register_windows_license(ida_dir, license_dir)
 
 
-def _register_windows_license():
+def _register_windows_license(ida_dir: str, license_dir: str):
     """Set the single HKCU registry value IDA's batch mode requires.
 
     IDA's kernel checks ONLY ``HKCU\\Software\\Hex-Rays\\IDA\\EULA 90``
@@ -119,6 +119,7 @@ def _register_windows_license():
         winreg.CloseKey(key)
     except Exception as e:  # noqa: BLE001
         log.warning("Could not set EULA 90 registry value: %s", e)
+
 
 # Imports that require ida_cmd/ida_helpers/handlers on sys.path (safe — they
 # lazy-import ida_* internally, so this does not touch idapro yet).
@@ -277,17 +278,164 @@ IDAWorkerError = IDAError
 # command), so no locking is needed.
 # ─────────────────────────────────────────────────────────────────────────────
 MULTI_AGENT = False
+READ_ONLY = False
+WORKER_NONCE = ""
+LINEAGE_FILE = ""
+_shutdown_requested = threading.Event()
+_finalizing = False
 
 # Commands that operate on global database state: with concurrent clients, an
 # undo or snapshot restore would silently destroy other agents' work.
 _MULTI_AGENT_BLOCKED = {"undo", "redo", "restore-snapshot"}
 
 _autosave = {"mutations": 0, "last_save": time.time()}
+_lineage: dict[str, Any] = {}
 
 
 def _mark_saved():
     _autosave["mutations"] = 0
     _autosave["last_save"] = time.time()
+
+
+def _sha256(path: str | None) -> str | None:
+    if not path or not os.path.isfile(path):
+        return None
+    before = os.stat(path)
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    after = os.stat(path)
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+        raise IDAError(f"File changed while hashing: {path}", "UnstableFile")
+    return digest.hexdigest()
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _write_lineage() -> None:
+    if not LINEAGE_FILE:
+        return
+    target = Path(LINEAGE_FILE)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f"{target.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(_lineage, indent=2) + "\n", encoding="utf-8")
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, target)
+
+
+def _lineage_copy() -> dict:
+    return json.loads(json.dumps(_lineage))
+
+
+def _source_identity() -> dict:
+    import ida_nalt
+
+    path = ida_nalt.get_input_file_path()
+    stored = ida_nalt.retrieve_input_file_sha256()
+    if isinstance(stored, bytes):
+        stored = stored.hex()
+    path = os.path.realpath(path) if path else None
+    current = _sha256(path)
+    return {
+        "path": path,
+        "ida_sha256": stored or None,
+        "file_sha256": current,
+        "file_status": "matched" if stored and current == stored else (
+            "changed" if stored and current else "unavailable"
+        ),
+    }
+
+
+def _database_path() -> str | None:
+    import ida_loader
+
+    path = ida_loader.get_path(ida_loader.PATH_TYPE_IDB)
+    return os.path.realpath(path) if path else None
+
+
+def _initialize_lineage() -> None:
+    database_path = _database_path()
+    packed_hash = _sha256(database_path)
+    _lineage.clear()
+    _lineage.update({
+        "version": 2,
+        "worker_pid": os.getpid(),
+        "nonce": WORKER_NONCE,
+        "writable": not READ_ONLY,
+        "source": _source_identity(),
+        "database": {
+            "path": database_path,
+            "open_sha256": packed_hash,
+            "confirmed_sha256": packed_hash,
+            "generation": 0,
+            "save_state": "open_clean",
+            "last_save_reason": None,
+            "last_save_started_at": None,
+            "last_save_completed_at": None,
+        },
+    })
+    _write_lineage()
+
+
+def _set_save_state(state: str, **fields: Any) -> None:
+    database = _lineage.setdefault("database", {})
+    database.update({"save_state": state, **fields})
+    _write_lineage()
+
+
+def _assert_source_identity() -> dict:
+    current = _source_identity()
+    expected = _lineage.get("source", {})
+    if expected.get("ida_sha256") and current.get("ida_sha256") != expected["ida_sha256"]:
+        raise IDAError("IDA source identity changed during the session", "SourceIdentityMismatch")
+    if current.get("file_status") == "changed":
+        raise IDAError("Original analysis input changed during the session", "SourceIdentityMismatch")
+    return current
+
+
+def _assert_database_lineage() -> tuple[str, str | None]:
+    database = _lineage.get("database", {})
+    path = database.get("path") or _database_path()
+    current = _sha256(path)
+    if current != database.get("confirmed_sha256"):
+        raise IDAError(
+            f"Packed database changed outside the owning worker ({database.get('confirmed_sha256')} -> {current})",
+            "ExternalDatabaseChange",
+        )
+    return path, current
+
+
+def _database_identity() -> dict:
+    import ida_loader
+
+    input_path = ida_loader.get_path(ida_loader.PATH_TYPE_CMD)
+    database_path = ida_loader.get_path(ida_loader.PATH_TYPE_IDB)
+    return {
+        "worker_pid": os.getpid(),
+        "nonce": WORKER_NONCE,
+        "writable": not READ_ONLY,
+        "multi_agent": MULTI_AGENT,
+        "requested_path": ida_session.current_path,
+        "input_path": os.path.realpath(input_path) if input_path else None,
+        "input_sha256": _sha256(input_path),
+        "database_path": os.path.realpath(database_path) if database_path else None,
+        "source": _source_identity(),
+        "database": dict(_lineage.get("database", {})),
+    }
+
+
+def _sidecars(database_path: str | None) -> list[str]:
+    if not database_path:
+        return []
+    root, ext = os.path.splitext(database_path)
+    if ext.lower() not in {".i64", ".idb"}:
+        root = database_path
+    return [path for suffix in (".id0", ".id1", ".id2", ".nam", ".til")
+            if os.path.exists(path := root + suffix)]
 
 
 def _probe_capabilities() -> dict[str, bool]:
@@ -323,6 +471,7 @@ def cmd_open(args: dict) -> dict:
     ida_session.current_path = file_path
     ida_session.capabilities = _probe_capabilities()
     _mark_saved()
+    _initialize_lineage()
     log.info("Opened (capabilities: %s)", ida_session.capabilities)
     return {"status": "ok", "path": file_path, "capabilities": ida_session.capabilities}
 
@@ -332,37 +481,140 @@ def cmd_close(args: dict) -> dict:
     import idapro
 
     save = args.get("save", True)
+    if save and READ_ONLY:
+        raise IDAError("Read-only workers cannot save", "ReadOnlyWorker")
     if not is_open():
         return {"status": "no_database_open"}
     path = ida_session.current_path
+    identity = _database_identity()
+    database_path = identity["database_path"]
+    reason = args.get("reason", "finalize" if save else "close-no-save")
+    if save:
+        _assert_source_identity()
+        _assert_database_lineage()
+        _set_save_state("finalizing", last_save_reason=reason, last_save_started_at=_utc_now())
+    else:
+        _assert_database_lineage()
     try:
         idapro.close_database(save)
     except Exception as e:  # noqa: BLE001
         log.exception("Error closing database")
+        _set_save_state("save_failed", last_error=str(e))
         raise IDAError(f"Error closing database: {e}", "CloseFailed")
-    finally:
-        ida_session.current_path = None
-        ida_session.capabilities = {}
-        _mark_saved()
-    return {"status": "closed", "path": path, "saved": save}
+    ida_session.current_path = None
+    ida_session.capabilities = {}
+    _mark_saved()
+    packed_hash = _sha256(database_path)
+    database = _lineage.setdefault("database", {})
+    if save:
+        database["generation"] = int(database.get("generation", 0)) + 1
+        database["confirmed_sha256"] = packed_hash
+    database.update({
+        "save_state": "closed",
+        "last_save_completed_at": _utc_now(),
+        "unsaved_mutations": 0 if save else _autosave["mutations"],
+    })
+    _write_lineage()
+    return {
+        "status": "closed",
+        "path": path,
+        "saved": save,
+        "database_path": database_path,
+        "database_sha256": packed_hash,
+        "lineage": _lineage_copy(),
+        "sidecars": _sidecars(database_path),
+    }
+
+
+def cmd_identity(args: dict) -> dict:
+    identity = {
+        "worker_pid": os.getpid(),
+        "nonce": WORKER_NONCE,
+        "writable": not READ_ONLY,
+        "database_open": is_open(),
+        "unsaved_mutations": _autosave["mutations"],
+        "lineage": _lineage_copy(),
+    }
+    if is_open():
+        identity.update(_database_identity())
+    return identity
+
+
+def cmd_finalize(args: dict) -> dict:
+    """Close explicitly and ask the owning worker to terminate."""
+    global _finalizing
+    if args.get("nonce") != WORKER_NONCE:
+        raise IDAError("Finalization nonce mismatch", "IdentityMismatch")
+    save = bool(args.get("save", True))
+    if save and READ_ONLY:
+        raise IDAError("Read-only workers must close with save=false", "ReadOnlyWorker")
+    _finalizing = True
+    try:
+        result = cmd_close({"save": save})
+    except Exception:
+        _finalizing = False
+        raise
+    _shutdown_requested.set()
+    result["shutdown_requested"] = True
+    return result
 
 
 def cmd_save(args: dict) -> dict:
     """Save the database (close+reopen without re-analysis to flush to disk)."""
     import idapro
 
+    if READ_ONLY:
+        raise IDAError("Read-only workers cannot save", "ReadOnlyWorker")
     if not is_open():
         raise IDAError("No database open", "NoDatabase")
-    path = ida_session.current_path
-    idapro.close_database(True)
+    requested_path = ida_session.current_path
+    reason = args.get("reason", "explicit")
+    _assert_source_identity()
+    database_path, pre_save_hash = _assert_database_lineage()
+    started_at = _utc_now()
+    _set_save_state(
+        "checkpointing", last_save_reason=reason,
+        last_save_started_at=started_at, pre_save_sha256=pre_save_hash,
+        unsaved_mutations_before=_autosave["mutations"],
+    )
+    try:
+        idapro.close_database(True)
+    except Exception as e:  # noqa: BLE001
+        _set_save_state("save_failed", last_error=str(e))
+        raise IDAError(f"Database checkpoint failed: {e}", "SaveFailed") from e
     ida_session.current_path = None
-    rc = idapro.open_database(path, False)
+    post_save_hash = _sha256(database_path)
+    rc = idapro.open_database(database_path, False)
     if rc != 0:
+        _set_save_state(
+            "recovery_required", candidate_sha256=post_save_hash,
+            last_error=f"reopen failed with error code {rc}",
+        )
         raise IDAError(f"Database saved but failed to reopen (error code {rc})", "SaveReopenFailed")
-    ida_session.current_path = path
+    ida_session.current_path = requested_path
     ida_session.capabilities = _probe_capabilities()
+    try:
+        source = _assert_source_identity()
+    except Exception:
+        _set_save_state("recovery_required", candidate_sha256=post_save_hash)
+        raise
+    database = _lineage["database"]
+    database.update({
+        "generation": int(database.get("generation", 0)) + 1,
+        "confirmed_sha256": post_save_hash,
+        "save_state": "open_clean",
+        "last_save_reason": reason,
+        "last_save_started_at": started_at,
+        "last_save_completed_at": _utc_now(),
+        "pre_save_sha256": pre_save_hash,
+        "post_save_sha256": post_save_hash,
+        "unsaved_mutations_before": _autosave["mutations"],
+        "unsaved_mutations_after": 0,
+    })
+    _lineage["source"] = source
     _mark_saved()
-    return {"status": "saved", "path": path}
+    _write_lineage()
+    return {"status": "checkpointed", "path": database_path, "lineage": _lineage_copy()}
 
 
 def cmd_list_commands(args: dict) -> dict:
@@ -383,11 +635,13 @@ _BUILTINS: dict[str, Callable[[dict], Any]] = {
     "open": cmd_open,
     "close": cmd_close,
     "save": cmd_save,
+    "identity": cmd_identity,
+    "finalize": cmd_finalize,
     "list-commands": cmd_list_commands,
 }
 
 # Lifecycle commands that are allowed without an open database.
-_NO_OPEN_REQUIRED = {"open", "close", "save", "list-commands"}
+_NO_OPEN_REQUIRED = {"open", "close", "save", "identity", "finalize", "list-commands"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -395,6 +649,19 @@ _NO_OPEN_REQUIRED = {"open", "close", "save", "list-commands"}
 # ─────────────────────────────────────────────────────────────────────────────
 def handle_command(cmd: str, args: dict) -> dict:
     args = args or {}
+
+    if _finalizing and cmd not in {"identity", "finalize"}:
+        raise IDAError("Worker finalization is in progress", "Finalizing")
+    if cmd in {"open", "close"}:
+        raise IDAError(
+            "Direct open/close is disabled; use bridge-managed worker lifecycle commands",
+            "LifecycleManaged",
+        )
+    if cmd == "restore-snapshot":
+        raise IDAError(
+            "Snapshot restore is disabled until it can run through the managed checkpoint protocol",
+            "LifecycleManaged",
+        )
 
     builtin = _BUILTINS.get(cmd)
     if builtin is not None:
@@ -409,6 +676,8 @@ def handle_command(cmd: str, args: dict) -> dict:
             available=available,
         )
 
+    if READ_ONLY and command.mutates:
+        raise IDAError(f"'{command.name}' is disabled in read-only mode", "ReadOnlyWorker")
     if MULTI_AGENT and command.name in _MULTI_AGENT_BLOCKED:
         raise IDAError(
             f"'{command.name}' is disabled in multi-agent mode: it rolls back "
@@ -421,9 +690,15 @@ def handle_command(cmd: str, args: dict) -> dict:
             "No database is open. Start a worker with --binary, or 'open' first.",
             "NoDatabase",
         )
+    if command.name == "set-database-flag" and str(args.get("flag", "")).lower() in {"kill", "temporary"}:
+        raise IDAError(
+            "The kill and temporary database flags are controlled by the managed lifecycle",
+            "LifecycleManaged",
+        )
     result = command.handler(args)
     if command.mutates:
         _autosave["mutations"] += 1
+        _set_save_state("open_dirty", unsaved_mutations=_autosave["mutations"])
     return result
 
 
@@ -514,12 +789,20 @@ def main():
     parser.add_argument("--multi-agent", dest="multi_agent", action="store_true",
                         help="Block global-state commands (undo/redo/restore-snapshot) "
                              "that are unsafe with concurrent clients")
+    parser.add_argument("--read-only", action="store_true",
+                        help="Reject database mutations and require no-save finalization")
+    parser.add_argument("--nonce", default="", help="Bridge-issued worker identity nonce")
+    parser.add_argument("--lineage-file", default="", help="Atomic checkpoint lineage journal")
     args = parser.parse_args()
 
-    global MULTI_AGENT
+    global MULTI_AGENT, READ_ONLY, WORKER_NONCE, LINEAGE_FILE
     MULTI_AGENT = args.multi_agent
+    READ_ONLY = args.read_only
+    WORKER_NONCE = args.nonce
+    LINEAGE_FILE = args.lineage_file
 
     _setup_environment()
+
     log.info("Bootstrapping idalib from %s", RUNTIME_DIR)
     import idapro
 
@@ -562,10 +845,10 @@ def main():
              idle_label, autosave_label, MULTI_AGENT)
 
     try:
-        while True:
+        while not _shutdown_requested.is_set():
             executor.drain(timeout=1.0)
             _maybe_autosave(args.autosave, tracker, executor)
-            if (args.idle_timeout > 0
+            if (READ_ONLY and args.idle_timeout > 0
                     and not tracker.busy()
                     and not executor.pending()
                     and tracker.idle_seconds() > args.idle_timeout):
@@ -575,16 +858,18 @@ def main():
         log.info("Shutting down...")
     finally:
         server.shutdown()
-        # Serve requests that were already in flight when the listener closed.
-        grace_deadline = time.monotonic() + 10
-        while (tracker.busy() or executor.pending()) and time.monotonic() < grace_deadline:
-            executor.drain(timeout=0.5)
+        # Once explicit finalization begins, reject queued work instead of
+        # allowing a mutation after the database was closed.
+        if not _finalizing:
+            grace_deadline = time.monotonic() + 10
+            while (tracker.busy() or executor.pending()) and time.monotonic() < grace_deadline:
+                executor.drain(timeout=0.5)
         executor.shutdown()
 
         if is_open():
             log.info("Saving database on shutdown: %s", ida_session.current_path)
             try:
-                cmd_close({"save": True})
+                cmd_close({"save": not READ_ONLY})
             except Exception:  # noqa: BLE001
                 log.exception("Failed to save database on shutdown")
 
@@ -613,7 +898,7 @@ def _maybe_autosave(interval: int, tracker: ActivityTracker, executor: MainThrea
     count = _autosave["mutations"]
     log.info("Autosave: flushing %d unsaved mutation(s)...", count)
     try:
-        cmd_save({})
+        cmd_save({"reason": "autosave"})
         log.info("Autosave complete")
     except Exception:  # noqa: BLE001
         # cmd_save failing on the reopen leg leaves the database closed —
