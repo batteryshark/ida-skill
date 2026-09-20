@@ -1,23 +1,24 @@
 #!/usr/bin/env node
 // setup.mjs
 // Provisions a minimal portable idalib runtime from the user's licensed
-// IDA Pro installation. Pure Node.js stdlib (Node >= 22). No npm deps.
+// IDA Pro installation. Pure Node.js stdlib (Node >= 18). No npm deps.
 //
-// IDA is proprietary: copy only from the user's local installation into an
-// ignored private bundle. Never modify the source installation or download IDA.
+// Unlike the ghidra-skill (which downloads from the internet), IDA is
+// proprietary — this script trims the user's LOCAL installation in-place.
 //
 // CRITICAL (macOS arm64): uses `ditto` instead of `cp` to preserve
 // code-signing extended attributes. Binaries copied with `cp` segfault.
 //
-// Run: node scripts/setup.mjs --ida-dir /path/to/ida [--include-license] [--full]
+// Run:  node setup.mjs [--ida-dir /path/to/ida] [--force]
 // Re-run safe: skips steps already completed.
 
+import { createHash } from 'node:crypto';
 import {
   existsSync, mkdirSync, readFileSync, writeFileSync,
   rmSync, readdirSync, statSync,
 } from 'node:fs';
 import { platform, arch, homedir } from 'node:os';
-import { join, dirname, basename, resolve, relative, isAbsolute, sep } from 'node:path';
+import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
@@ -26,8 +27,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // ─────────────────────────────────────────────────────────────────────────────
 // Config
 // ─────────────────────────────────────────────────────────────────────────────
-const DEFAULT_BIN_DIR = join(__dirname, '..', 'bin');
-let BIN_DIR = DEFAULT_BIN_DIR;
+const BIN_DIR = join(__dirname, '..', 'bin');
 
 // plat and RUNTIME_DIR are set in main() based on --target-platform
 let plat = null;
@@ -39,31 +39,32 @@ let PLATFORM_KEY = null;
 // ─────────────────────────────────────────────────────────────────────────────
 const HOST_PLATFORM_KEY = `${platform()}-${arch()}`;
 const PLATFORM_INFO = {
-  'darwin-arm64': { os: 'mac', libExt: '.dylib' },
-  'darwin-x64':   { os: 'mac', libExt: '.dylib' },
-  'linux-x64':    { os: 'linux', libExt: '.so' },
-  'linux-arm64':  { os: 'linux', libExt: '.so' },
-  'win32-x64':    { os: 'windows', libExt: '.dll' },
+  'darwin-arm64': { os: 'mac', arch: 'arm64', libExt: '.dylib', copyCmd: 'ditto' },
+  'darwin-x64':   { os: 'mac', arch: 'x64',  libExt: '.dylib', copyCmd: 'ditto' },
+  'linux-x64':    { os: 'linux', arch: 'x64', libExt: '.so',   copyCmd: 'cp'   },
+  'linux-arm64':  { os: 'linux', arch: 'arm64', libExt: '.so', copyCmd: 'cp'   },
+  'win32-x64':    { os: 'windows', arch: 'x64', libExt: '.dll', copyCmd: 'robocopy' },
 };
 
 // Target platform can be overridden via --target-platform for cross-trimming
 // (e.g. trimming a Windows IDA from macOS).
+let _targetOs = null;
 function getTargetPlatform(targetArg) {
   if (targetArg) {
     const map = {
-      'windows': { os: 'windows', libExt: '.dll' },
-      'mac':     { os: 'mac', libExt: '.dylib' },
-      'linux':   { os: 'linux', libExt: '.so' },
+      'windows': { os: 'windows', libExt: '.dll', copyCmd: 'cp' }, // cp when cross-trimming
+      'mac':     { os: 'mac',     libExt: '.dylib' },
+      'linux':   { os: 'linux',   libExt: '.so' },
     };
     const t = map[targetArg];
-    if (!t) throw new Error(`Unknown --target-platform: ${targetArg}. Use: windows, mac, linux`);
+    if (!t) {
+      console.error(`Unknown --target-platform: ${targetArg}. Use: windows, mac, linux`);
+      process.exit(1);
+    }
     return t;
   }
-  const host = PLATFORM_INFO[HOST_PLATFORM_KEY];
-  if (!host) {
-    throw new Error(`Unsupported host platform: ${HOST_PLATFORM_KEY}. Use --target-platform with a readable IDA installation.`);
-  }
-  return host;
+  // Default: use the host platform
+  return PLATFORM_INFO[HOST_PLATFORM_KEY];
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -80,6 +81,11 @@ const CORE_LIBS_BY_PLATFORM = {
 };
 function getCoreLibs(os) {
   return CORE_LIBS_BY_PLATFORM[os] || CORE_LIBS_BY_PLATFORM.linux;
+}
+
+// Python native binding extension: .pyd (Windows), .so (macOS/Linux)
+function getPydExt(os) {
+  return os === 'windows' ? '.pyd' : '.so';
 }
 
 // Required non-library files
@@ -114,12 +120,18 @@ const KEEP_TIL_ARM = [
   'gnulnx_arm.til', 'gnulnx_arm64.til', 'android_arm64.til', 'armv12.til',
 ];
 
+// Directories to skip entirely
+const SKIP_DIRS = new Set([
+  'docs', 'tools', 'sig', 'dbgsrv', 'themes', 'idc', 'ids',
+  'include', '__pycache__',
+]);
+
 // ─────────────────────────────────────────────────────────────────────────────
 // IDA installation discovery
 // ─────────────────────────────────────────────────────────────────────────────
 
 function findIdaDir(explicit) {
-  if (explicit) return existsSync(explicit) ? resolveIdaDir(explicit) : null;
+  if (explicit && existsSync(explicit)) return resolveIdaDir(explicit);
 
   // IDADIR env var
   const envIdadir = process.env.IDADIR;
@@ -135,7 +147,7 @@ function findIdaDir(explicit) {
 
 function resolveIdaDir(dir) {
   // macOS .app bundle: point at Contents/MacOS
-  if (basename(dir).endsWith('.app')) {
+  if (platform() === 'darwin' && basename(dir).endsWith('.app')) {
     return join(dir, 'Contents', 'MacOS');
   }
   return dir;
@@ -164,9 +176,11 @@ function validateIdaDir(dir) {
   const kernelNames = plat.os === 'windows'
     ? ['ida.dll', 'ida64.dll']
     : [`libida${libExt}`, `libida64${libExt}`];
-  return kernelNames.some(name => existsSync(join(dir, name)))
-    && existsSync(join(dir, 'ida.hlp'))
-    && existsSync(join(dir, 'ida.int'));
+  for (const name of kernelNames) {
+    if (existsSync(join(dir, name))) return true;
+  }
+  // Fallback: check for ida.hlp (always present)
+  return existsSync(join(dir, 'ida.hlp'));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -178,38 +192,30 @@ function validateIdaDir(dir) {
 const HOST_COPY_CMD = HOST_PLATFORM_KEY.startsWith('darwin') ? 'ditto'
   : HOST_PLATFORM_KEY.startsWith('win32') ? 'robocopy' : 'cp';
 
-function runCopy(command, args, robocopy = false) {
-  const result = spawnSync(command, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-  const ok = robocopy
-    ? result.status !== null && result.status >= 0 && result.status <= 7
-    : result.status === 0;
-  if (ok) return;
-  const detail = result.error?.message || result.stderr?.toString().trim() || `exit ${result.status}`;
-  throw new Error(`${command} failed: ${detail}`);
-}
-
 function copyFile(src, dest) {
   mkdirSync(dirname(dest), { recursive: true });
   if (HOST_COPY_CMD === 'ditto') {
     // ditto preserves code-signing extended attributes (CRITICAL on macOS arm64)
-    runCopy('ditto', [src, dest]);
+    spawnSync('ditto', [src, dest], { stdio: ['ignore', 'pipe', 'pipe'] });
   } else if (HOST_COPY_CMD === 'robocopy') {
-    // Preserve file data, attributes, and timestamps without requiring admin rights.
-    runCopy('robocopy', [dirname(src), dirname(dest), basename(src), '/COPY:DAT', '/NFL', '/NDL', '/NJH', '/NJS'], true);
+    // robocopy /COPYALL preserves ACLs and alternate data streams
+    spawnSync('robocopy', [dirname(src), dirname(dest), basename(src), '/COPY:DAT', '/NFL', '/NDL', '/NJH', '/NJS'],
+      { stdio: ['ignore', 'pipe', 'pipe'] });
   } else {
     // Linux: cp -a preserves permissions and timestamps
-    runCopy('cp', ['-a', src, dest]);
+    spawnSync('cp', ['-a', src, dest], { stdio: ['ignore', 'pipe', 'pipe'] });
   }
 }
 
 function copyDir(src, dest) {
   mkdirSync(dest, { recursive: true });
   if (HOST_COPY_CMD === 'ditto') {
-    runCopy('ditto', [src, dest]);
+    spawnSync('ditto', [src, dest], { stdio: ['ignore', 'pipe', 'pipe'] });
   } else if (HOST_COPY_CMD === 'robocopy') {
-    runCopy('robocopy', [src, dest, '/E', '/COPY:DAT', '/NFL', '/NDL', '/NJH', '/NJS'], true);
+    spawnSync('robocopy', [src, dest, '/E', '/COPY:DAT', '/NFL', '/NDL', '/NJH', '/NJS'],
+      { stdio: ['ignore', 'pipe', 'pipe'] });
   } else {
-    runCopy('cp', ['-a', `${src}/.`, dest]);
+    spawnSync('cp', ['-a', `${src}/.`, dest], { stdio: ['ignore', 'pipe', 'pipe'] });
   }
 }
 
@@ -249,39 +255,54 @@ function provisionCore(idaDir) {
   }
 }
 
-function provisionLicense(idaDir, explicitLicenseDir) {
+function provisionLicense(idaDir) {
   console.log('[license] Bundling license...');
   const destDir = join(RUNTIME_DIR, 'license');
   mkdirSync(destDir, { recursive: true });
 
-  const sourceDirs = [explicitLicenseDir, idaDir, join(homedir(), '.idapro')].filter(Boolean);
+  // 1. Copy idapro.hexlic (the actual license file)
+  const hexlicCandidates = [
+    join(idaDir, 'idapro.hexlic'),
+    join(homedir(), '.idapro', 'idapro.hexlic'),
+  ];
   if (process.env.APPDATA) {
-    sourceDirs.push(join(process.env.APPDATA, 'Hex-Rays', 'IDA Pro'));
+    hexlicCandidates.push(join(process.env.APPDATA, 'Hex-Rays', 'IDA Pro', 'idapro.hexlic'));
   }
-  const uniqueDirs = [...new Set(sourceDirs.map(dir => resolve(dir)))];
-
-  const hexlic = uniqueDirs.map(dir => join(dir, 'idapro.hexlic')).find(existsSync);
-  if (!hexlic) {
-    throw new Error('idapro.hexlic not found. Pass --license-dir /path/to/your/IDA/user-config directory.');
-  }
-  copyFile(hexlic, join(destDir, 'idapro.hexlic'));
-  console.log('[license] Copied idapro.hexlic');
-
-  // macOS/Linux keep EULA state in ida.reg. Windows applies the equivalent
-  // per-user registry value when the licensed worker starts.
-  if (plat.os !== 'windows') {
-    const reg = uniqueDirs.map(dir => join(dir, 'ida.reg')).find(existsSync);
-    if (!reg) {
-      throw new Error('ida.reg not found. Start IDA once and accept its EULA, then pass --license-dir if needed.');
+  for (const src of hexlicCandidates) {
+    if (existsSync(src)) {
+      copyFile(src, join(destDir, 'idapro.hexlic'));
+      console.log(`[license] hexlic: ${src}`);
+      break;
     }
-    copyFile(reg, join(destDir, 'ida.reg'));
-    console.log('[license] Copied ida.reg');
   }
 
-  const config = uniqueDirs.map(dir => join(dir, 'ida-config.json')).find(existsSync);
-  if (config) {
-    copyFile(config, join(destDir, 'ida-config.json'));
-    console.log('[license] Copied ida-config.json');
+  // 2. Copy ida.reg (macOS/Linux EULA acceptance — makes runtime self-contained)
+  const regCandidates = [
+    join(homedir(), '.idapro', 'ida.reg'),
+  ];
+  for (const src of regCandidates) {
+    if (existsSync(src)) {
+      copyFile(src, join(destDir, 'ida.reg'));
+      console.log(`[license] ida.reg: ${src}`);
+      break;
+    }
+  }
+
+  // 3. Copy ida-config.json if it exists (install dir pointer)
+  const configCandidates = [
+    join(homedir(), '.idapro', 'ida-config.json'),
+    join(idaDir, 'ida-config.json'),
+  ];
+  for (const src of configCandidates) {
+    if (existsSync(src)) {
+      copyFile(src, join(destDir, 'ida-config.json'));
+      console.log(`[license] ida-config.json: ${src}`);
+      break;
+    }
+  }
+
+  if (!existsSync(join(destDir, 'idapro.hexlic'))) {
+    console.warn('[license] WARNING: idapro.hexlic not found anywhere.');
   }
 }
 
@@ -437,37 +458,29 @@ function provisionDbgsrv(idaDir) {
     copyFile(join(srcDir, name), join(destDir, name));
   }
   const count = readdirSync(destDir).length;
-  console.log(`[dbgsrv] Copied ${count} remote debug servers to ${destDir}`);
+  console.log(`[dbgsrv] Copied ${count} remote debug servers to bin/dbgsrv/`);
 }
 
-function provisionComplete(idaDir, includeLicense) {
-  // Copy the untrimmed product installation. Personal license/EULA state is
-  // still opt-in even if it happens to live in the installation directory.
+function provisionComplete(idaDir) {
+  // Just copy everything (for --full mode)
   console.log('[full] Copying entire IDA installation (untrimmed)...');
-  const privateState = new Set(['idapro.hexlic', 'ida.reg', 'ida-config.json', 'license']);
   for (const entry of readdirSync(idaDir)) {
-    if (!includeLicense && privateState.has(entry.toLowerCase())) continue;
+    if (SKIP_DIRS.has(entry)) continue;
     const src = join(idaDir, entry);
     if (statSync(src).isDirectory()) copyDir(src, join(RUNTIME_DIR, entry));
     else copyFile(src, join(RUNTIME_DIR, entry));
   }
 }
 
-function writeMarker(fullMode, licenseIncluded) {
+function writeMarker(idaDir) {
   const marker = join(RUNTIME_DIR, '.provisioned');
   writeFileSync(marker, JSON.stringify({
-    schema: 3,
+    schema: 2,
     platform: PLATFORM_KEY,
     runtime: basename(RUNTIME_DIR),
-    mode: fullMode ? 'full' : 'trimmed',
-    licenseIncluded,
+    idaSource: idaDir,
     timestamp: new Date().toISOString(),
   }, null, 2));
-}
-
-function isWithin(parent, child) {
-  const rel = relative(resolve(parent), resolve(child));
-  return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
 }
 
 function dirSize(dir) {
@@ -504,7 +517,7 @@ function trustMacRuntime() {
   }
 }
 
-function validateProvisionedRuntime(requireLicense = false) {
+function validateProvisionedRuntime() {
   const core = plat.os === 'windows' ? 'idalib.dll'
     : plat.os === 'mac' ? 'libidalib.dylib' : 'libidalib.so';
   const required = [
@@ -512,62 +525,10 @@ function validateProvisionedRuntime(requireLicense = false) {
     'ida.hlp',
     join('idalib', 'python', 'idapro'),
     join('python'),
+    join('license', 'idapro.hexlic'),
   ];
-  if (requireLicense) {
-    required.push(join('license', 'idapro.hexlic'));
-    if (plat.os !== 'windows') required.push(join('license', 'ida.reg'));
-  }
+  if (plat.os !== 'windows') required.push(join('license', 'ida.reg'));
   return required.filter(path => !existsSync(join(RUNTIME_DIR, path)));
-}
-
-function usage() {
-  console.log(`Usage: node scripts/setup.mjs [options]
-
-Copy a locally installed, licensed IDA Pro runtime into a private portable bundle.
-
-Options:
-  --ida-dir <path>          IDA installation or macOS .app bundle
-  --target-platform <os>   mac, linux, or windows (defaults to this host)
-  --bundle-dir <path>       Private payload root (default: ./bin)
-  --license-dir <path>      Directory containing idapro.hexlic and ida.reg
-  --include-license         Copy private license/EULA state into the bundle
-  --full                    Copy the complete installation instead of trimming
-  --force                   Replace the selected runtime
-  --help                    Show this help
-
-Set IDA_SKILL_BIN_DIR to the same --bundle-dir when starting the bridge.`);
-}
-
-function parseArgs(args) {
-  const options = {
-    force: false,
-    fullMode: false,
-    includeLicense: false,
-    idaDir: null,
-    targetPlatform: null,
-    bundleDir: null,
-    licenseDir: null,
-    help: false,
-  };
-  const values = new Set(['--ida-dir', '--target-platform', '--bundle-dir', '--license-dir']);
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i];
-    if (arg === '--force') options.force = true;
-    else if (arg === '--full') options.fullMode = true;
-    else if (arg === '--include-license') options.includeLicense = true;
-    else if (arg === '--help' || arg === '-h') options.help = true;
-    else if (values.has(arg)) {
-      const value = args[++i];
-      if (!value) throw new Error(`${arg} requires a value`);
-      if (arg === '--ida-dir') options.idaDir = value;
-      else if (arg === '--target-platform') options.targetPlatform = value;
-      else if (arg === '--bundle-dir') options.bundleDir = value;
-      else options.licenseDir = value;
-    } else {
-      throw new Error(`Unknown option: ${arg}`);
-    }
-  }
-  return options;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -575,45 +536,37 @@ function parseArgs(args) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function main() {
-  const options = parseArgs(process.argv.slice(2));
-  if (options.help) {
-    usage();
-    return;
-  }
-  if (options.idaDir && !existsSync(options.idaDir)) {
-    throw new Error(`Explicit --ida-dir does not exist: ${options.idaDir}`);
-  }
-  if (options.licenseDir && !existsSync(options.licenseDir)) {
-    throw new Error(`Explicit --license-dir does not exist: ${options.licenseDir}`);
-  }
+  const args = process.argv.slice(2);
+  const force = args.includes('--force');
+  const fullMode = args.includes('--full');
+  let explicitIda = null;
+  let targetPlatformArg = null;
+
+  const idaIdx = args.indexOf('--ida-dir');
+  if (idaIdx !== -1 && args[idaIdx + 1]) explicitIda = args[idaIdx + 1];
+
+  const tpIdx = args.indexOf('--target-platform');
+  if (tpIdx !== -1 && args[tpIdx + 1]) targetPlatformArg = args[tpIdx + 1];
 
   // Determine target platform (host platform by default, or --target-platform for cross-trimming)
-  plat = getTargetPlatform(options.targetPlatform);
-  PLATFORM_KEY = options.targetPlatform || HOST_PLATFORM_KEY;
-  BIN_DIR = resolve(options.bundleDir || process.env.IDA_SKILL_BIN_DIR || DEFAULT_BIN_DIR);
+  plat = getTargetPlatform(targetPlatformArg);
+  PLATFORM_KEY = targetPlatformArg || HOST_PLATFORM_KEY;
   // Keep runtime folder names stable and identical to bridge.mjs/worker.py.
   // Architecture is implicit in the host build; cross-trimming already uses
   // the same mac/windows/linux key.
-  const runtimeName = `ida-runtime-${options.targetPlatform || plat.os}`;
+  const runtimeName = `ida-runtime-${targetPlatformArg || plat.os}`;
   RUNTIME_DIR = join(BIN_DIR, runtimeName);
 
   console.log('ida-skill setup');
   console.log(`  host     : ${HOST_PLATFORM_KEY}`);
-  console.log(`  target   : ${options.targetPlatform || HOST_PLATFORM_KEY} (${plat.os})`);
-  console.log(`  bundle   : ${BIN_DIR}`);
+  console.log(`  target   : ${targetPlatformArg || HOST_PLATFORM_KEY} (${plat.os})`);
   console.log(`  runtime  : ${RUNTIME_DIR}`);
-  console.log(`  mode     : ${options.fullMode ? 'full (untrimmed)' : 'trimmed'}`);
-  console.log(`  license  : ${options.includeLicense ? 'included (private)' : 'system configuration'}`);
+  console.log(`  mode     : ${fullMode ? 'full (untrimmed)' : 'trimmed'}`);
   console.log('');
 
   // Validate runtime already exists
   const marker = join(RUNTIME_DIR, '.provisioned');
-  if (existsSync(marker) && !options.force) {
-    let previous = {};
-    try { previous = JSON.parse(readFileSync(marker, 'utf8')); } catch {}
-    if (options.fullMode && previous.mode && previous.mode !== 'full') {
-      throw new Error('Existing runtime is trimmed. Re-run with --full --force to replace it.');
-    }
+  if (existsSync(marker) && !force) {
     const missing = validateProvisionedRuntime();
     if (missing.length) {
       console.error(`ERROR: Existing runtime is incomplete: ${RUNTIME_DIR}`);
@@ -621,31 +574,22 @@ function main() {
       console.error('Re-run setup with --force to repair it.');
       process.exit(1);
     }
-    if (options.includeLicense) {
-      const licenseIdaDir = options.idaDir ? resolveIdaDir(options.idaDir) : findIdaDir(null);
-      provisionLicense(licenseIdaDir, options.licenseDir);
-      const licenseMissing = validateProvisionedRuntime(true);
-      if (licenseMissing.length) throw new Error(`Bundled license state is incomplete: ${licenseMissing.join(', ')}`);
-    }
+    // Trust approvals and licenses can change after initial provisioning.
+    // Refresh the small per-user state without recopying the 200+ MB runtime.
+    provisionLicense(RUNTIME_DIR);
     trustMacRuntime();
-    writeMarker(
-      previous.mode === 'full',
-      options.includeLicense || existsSync(join(RUNTIME_DIR, 'license', 'idapro.hexlic')),
-    );
     console.log(`Runtime already provisioned -> ${RUNTIME_DIR}`);
-    console.log(options.includeLicense
-      ? 'License/EULA state refreshed. Use --force to fully re-provision.'
-      : 'Use --include-license to add private portable license state, or --force to re-provision.');
+    console.log('License/EULA state refreshed. Use --force to fully re-provision.');
     return;
   }
 
   // Find IDA installation
-  const idaDir = findIdaDir(options.idaDir);
+  const idaDir = findIdaDir(explicitIda);
   if (!idaDir) {
     console.error('ERROR: IDA Pro installation not found.');
     console.error('');
     console.error('Specify your IDA installation directory:');
-    console.error('  node scripts/setup.mjs --ida-dir "/path/to/ida" [--include-license]');
+    console.error('  node setup.mjs --ida-dir "/path/to/ida" [--target-platform windows]');
     console.error('');
     console.error('Or set the IDADIR environment variable.');
     process.exit(1);
@@ -660,24 +604,20 @@ function main() {
   console.log(`  ida dir  : ${idaDir}`);
   console.log('');
 
-  if (isWithin(idaDir, RUNTIME_DIR) || isWithin(RUNTIME_DIR, idaDir)) {
-    throw new Error('IDA source and runtime destination must not overlap. Choose a separate --bundle-dir.');
-  }
-
   // Wipe and recreate
-  if (options.force || !existsSync(marker)) {
+  if (force || !existsSync(marker)) {
     rmSync(RUNTIME_DIR, { recursive: true, force: true });
   }
   mkdirSync(RUNTIME_DIR, { recursive: true });
 
   // Provision
-  if (options.fullMode) {
-    provisionComplete(idaDir, options.includeLicense);
-    if (options.includeLicense) provisionLicense(idaDir, options.licenseDir);
+  if (fullMode) {
+    provisionComplete(idaDir);
+    provisionLicense(idaDir);
     provisionDbgsrv(idaDir);
   } else {
     provisionCore(idaDir);
-    if (options.includeLicense) provisionLicense(idaDir, options.licenseDir);
+    provisionLicense(idaDir);
     provisionPlugins(idaDir);
     provisionProcs(idaDir);
     provisionLoaders(idaDir);
@@ -688,9 +628,9 @@ function main() {
   }
 
   trustMacRuntime();
-  writeMarker(options.fullMode, options.includeLicense);
+  writeMarker(idaDir);
 
-  const missing = validateProvisionedRuntime(options.includeLicense);
+  const missing = validateProvisionedRuntime();
   if (missing.length) {
     console.error(`ERROR: Provisioned runtime is incomplete: ${missing.join(', ')}`);
     process.exit(1);
@@ -700,26 +640,16 @@ function main() {
   console.log('');
   console.log(`Done. Runtime size: ${sizeMB} MB`);
   console.log(`  ${RUNTIME_DIR}`);
-  if (options.targetPlatform) {
+  if (targetPlatformArg) {
     console.log('');
-    console.log('NOTE: This runtime uses the explicit target platform layout.');
+    console.log('NOTE: This is a cross-trimmed runtime for a different platform.');
     console.log('The runtime is at: ' + RUNTIME_DIR);
   }
   console.log('');
-  if (!options.includeLicense) {
-    console.log('License was not copied. The worker will use this machine\'s normal IDA configuration.');
-    console.log('Re-run with --include-license for a private self-contained bundle.');
-    console.log('');
-  }
   console.log('Next steps:');
-  console.log('  Start worker:  node scripts/bridge.mjs start --binary /path/to/binary');
+  console.log('  Start worker:  python3 scripts/cli.py worker start --binary /path/to/binary');
   console.log('  Query:         python3 scripts/cli.py functions --binary /path/to/binary');
-  console.log('  Stop:          node scripts/bridge.mjs stop --binary /path/to/binary');
+  console.log('  Finalize:      python3 scripts/cli.py worker save-and-close --binary /path/to/binary');
 }
 
-try {
-  main();
-} catch (error) {
-  console.error(`ERROR: ${error.message}`);
-  process.exit(1);
-}
+main();

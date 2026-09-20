@@ -8,14 +8,13 @@ schema). Handler modules under ``handlers/`` build a module-level
 
 Crucially this module imports **no** ``ida_*`` package, and handler modules
 keep their ``ida_*`` imports *inside* functions. That means the full command
-manifest can be imported and introspected by ``cli.py`` and ``mcp_server.py``
-on any Python — no provisioned IDA runtime required. The manifest is the
-single source of truth that drives:
+manifest can be imported and introspected by ``cli.py`` and ``mcp.py`` on any
+Python — no provisioned IDA runtime required. The manifest is the single
+source of truth that drives:
 
   * the worker's command registry / dispatch (worker.py)
   * the CLI's per-command argparse + help (cli.py)
-  * the MCP server's generated tools (mcp_server.py)
-  * the generated reference tables (scripts/gen_reference.py)
+  * the MCP server's generated tools (mcp.py)
 
 Handlers receive a single ``args: dict`` and return a JSON-serializable value
 (usually a ``dict``). On failure they raise :class:`IDAError`.
@@ -87,6 +86,12 @@ class Command:
 
     def all_names(self) -> list[str]:
         return [self.name, *self.aliases]
+
+
+BUILTIN_COMMANDS = [
+    Command("save", None, "lifecycle", "Flush the database to disk."),
+    Command("list-commands", None, "lifecycle", "List all commands (worker-side)."),
+]
 
 
 def build_registry(modules: list) -> dict[str, Command]:

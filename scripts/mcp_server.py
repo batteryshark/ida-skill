@@ -1,24 +1,23 @@
 #!/usr/bin/env python3
-# /// script
-# requires-python = ">=3.12"
-# dependencies = ["fastmcp>=2.0,<3"]
+# /// script, requires-python = ">=3.12"
+# /// dependencies = ["fastmcp>=2.0,<3"]
 # ///
-"""mcp_server.py — MCP server mode for the idalib worker (manifest-driven).
+"""mcp.py — MCP server mode for the idalib worker (manifest-driven).
 
 Generates one MCP tool per worker command from the shared manifest in
 ``handlers/`` + ``ida_cmd.py``, so the MCP surface stays in lock-step with the
 CLI automatically — no hand-written wrappers to drift.
 
 Usage (with uv):
-  uv run scripts/mcp_server.py --binary /path/to/binary
-  uv run scripts/mcp_server.py --port 62927
+  uv run scripts/mcp.py --binary /path/to/binary
+  uv run scripts/mcp.py --port 62927
 
 Harness config (Claude Code, Cursor):
   {
     "mcpServers": {
       "ida": {
         "command": "uv",
-        "args": ["run", "/path/to/ida-skill/scripts/mcp_server.py", "--binary", "/path/to/bin"]
+        "args": ["run", "/path/to/rekit-private/skills/ida-skill/scripts/mcp.py", "--binary", "/path/to/bin"]
       }
     }
   }
@@ -39,10 +38,10 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from ida_cmd import Command, Param  # noqa: E402
+from ida_cmd import BUILTIN_COMMANDS, Command  # noqa: E402
 import handlers  # noqa: E402
 
-BIN_DIR = Path(os.environ.get("IDA_SKILL_BIN_DIR", SCRIPT_DIR.parent / "bin")).expanduser().resolve()
+BIN_DIR = SCRIPT_DIR.parent / "bin"
 RUNTIME_STATE = BIN_DIR / "runtime"
 
 _worker_port: int | None = None
@@ -53,9 +52,8 @@ _worker_binary: str | None = None
 # Worker connection
 # ─────────────────────────────────────────────────────────────────────────────
 def resolve_port(binary: str | None = None, port: int | None = None) -> int:
-    selected_port = port if port is not None else _worker_port
-    if selected_port is not None:
-        return selected_port
+    if port:
+        return port
     if binary is None:
         binary = _worker_binary
     if binary is None:
@@ -108,17 +106,6 @@ mcp = FastMCP("IDA Pro")
 
 _KIND_TO_TYPE = {"str": str, "int": int, "bool": bool, "hex": str, "json": Any}
 
-_BUILTIN_SPECS = [
-    Command("open", None, "lifecycle", "Open a binary/database in the worker.",
-            params=[Param("file_path", "str", required=True, help="Path to binary or .i64/.idb."),
-                    Param("run_auto_analysis", "bool", default=True, help="Run auto-analysis.")]),
-    Command("close", None, "lifecycle", "Close the current database.",
-            params=[Param("save", "bool", default=True, help="Save before closing.")]),
-    Command("save", None, "lifecycle", "Flush the database to disk."),
-    Command("list-commands", None, "lifecycle", "List all commands (worker-side)."),
-]
-
-
 def _make_tool_fn(cmd: Command):
     json_params = {p.name for p in cmd.params if p.kind == "json"}
 
@@ -152,7 +139,7 @@ def _make_tool_fn(cmd: Command):
 
 def register_all():
     seen: set[str] = set()
-    for cmd in _BUILTIN_SPECS + list(handlers.COMMANDS):
+    for cmd in BUILTIN_COMMANDS + list(handlers.COMMANDS):
         tool_name = cmd.name.replace("-", "_")
         if tool_name in seen:
             continue
@@ -164,9 +151,6 @@ def register_all():
 @mcp.tool()
 def bridge_status() -> str:
     """Check if the worker is running and get database info."""
-    if _worker_binary is None and _worker_port is not None:
-        return json.dumps(send_command(_worker_port, "info", {}), indent=2, default=str)
-
     import subprocess
 
     result = subprocess.run(
@@ -198,7 +182,8 @@ def main():
         print(f"Connected to worker on port {port}", file=sys.stderr)
     except Exception as e:  # noqa: BLE001
         print(f"WARNING: {e}", file=sys.stderr)
-        print("Start a worker first: node scripts/bridge.mjs start --binary <path>", file=sys.stderr)
+        print("Start a worker first: python3 scripts/cli.py worker start --binary <path>",
+              file=sys.stderr)
 
     mcp.run(transport="stdio")
 

@@ -10,6 +10,7 @@ Usage:
   python cli.py <command> [args] --binary <path> [--port <n>] [--output text|json] [--raw]
   python cli.py call <command> key=value [key2=value2 ...] --binary <path>
   python cli.py commands [--category X]
+  python cli.py worker <start|status|save-and-close|close-no-save|recover-unclosed-database|clear-stale-read-only> [options]
 
 Examples:
   python cli.py info --binary a.out
@@ -17,14 +18,17 @@ Examples:
   python cli.py decompile main --binary a.out
   python cli.py call get-xrefs-to address=main --binary a.out
 
-For the full command reference, read references/*.md or run `commands`.
+Set IDA_BINARY to omit repeated --binary options. Run `commands` for discovery
+and `<command> --help` for exact parameters.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import shutil
 import socket
+import subprocess
 import sys
 from pathlib import Path
 
@@ -32,60 +36,44 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from ida_cmd import Command, Param  # noqa: E402
+from ida_cmd import BUILTIN_COMMANDS, Command, Param  # noqa: E402
 import handlers  # noqa: E402
 
-BIN_DIR = Path(os.environ.get("IDA_SKILL_BIN_DIR", SCRIPT_DIR.parent / "bin")).expanduser().resolve()
-RUNTIME_STATE = BIN_DIR / "runtime"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Built-in lifecycle commands — schema only (handled by the worker directly)
-# ─────────────────────────────────────────────────────────────────────────────
-_BUILTIN_SPECS = [
-    Command("open", None, "lifecycle", "Open a binary/database in the worker.",
-            params=[Param("file_path", "str", required=True, positional=True,
-                          help="Path to binary or .i64/.idb."),
-                    Param("run_auto_analysis", "bool", default=True,
-                          help="Run auto-analysis on open.")]),
-    Command("close", None, "lifecycle", "Close the current database.",
-            params=[Param("save", "bool", default=True, help="Save before closing.")]),
-    Command("save", None, "lifecycle", "Flush the database to disk."),
-    Command("list-commands", None, "lifecycle", "List all commands (worker-side)."),
-]
+BIN_DIR = SCRIPT_DIR.parent / "bin"
+RUNTIME_STATE = Path(os.environ.get("IDA_SKILL_STATE_DIR", BIN_DIR / "runtime"))
 
 
 def _all_commands() -> list[Command]:
-    return _BUILTIN_SPECS + list(handlers.COMMANDS)
+    return BUILTIN_COMMANDS + list(handlers.COMMANDS)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Worker connection
 # ─────────────────────────────────────────────────────────────────────────────
-def _auto_start_worker(binary_path: str) -> bool:
+def _auto_start_worker(binary_path: str, read_only: bool = True) -> bool:
     """Start the worker via bridge.mjs. Safe under concurrency: the bridge
     serializes simultaneous starts with a lock file, so N agents racing here
     converge on one worker. Opt out with IDA_SKILL_NO_AUTOSTART=1."""
     if os.environ.get("IDA_SKILL_NO_AUTOSTART"):
         return False
-    import shutil
-    import subprocess
-
     node = shutil.which("node")
     if node is None:
         print("ERROR: node not found on PATH; cannot auto-start the worker.", file=sys.stderr)
         return False
     print(f"No running worker for {binary_path}; starting one (this can take a while "
           "on first import)...", file=sys.stderr)
+    command = [node, str(SCRIPT_DIR / "bridge.mjs"), "start", "--binary", binary_path]
+    if read_only:
+        command.append("--read-only")
     proc = subprocess.run(
-        [node, str(SCRIPT_DIR / "bridge.mjs"), "start", "--binary", binary_path],
+        command,
         stdout=sys.stderr, stderr=sys.stderr,
     )
     return proc.returncode == 0
 
 
 def resolve_port(binary_path: str | None, explicit_port: int | None = None,
-                 auto_start: bool = True) -> int:
+                 auto_start: bool = True, read_only: bool = True) -> int:
     if explicit_port:
         return explicit_port
     if not binary_path:
@@ -98,11 +86,11 @@ def resolve_port(binary_path: str | None, explicit_port: int | None = None,
     h = hashlib.md5(resolved.encode()).hexdigest()[:12]
     port_file = RUNTIME_STATE / f"worker-{h}.port"
     if not port_file.exists() and auto_start:
-        _auto_start_worker(binary_path)
+        _auto_start_worker(binary_path, read_only=read_only)
     if not port_file.exists():
         print(f"ERROR: No worker found for {binary_path}", file=sys.stderr)
         print(f"  Port file not found: {port_file}", file=sys.stderr)
-        print(f"  Start a worker: node scripts/bridge.mjs start --binary '{binary_path}'", file=sys.stderr)
+        print(f"  Start a worker: python3 scripts/cli.py worker start --binary '{binary_path}'", file=sys.stderr)
         sys.exit(1)
     return int(port_file.read_text().strip())
 
@@ -172,10 +160,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="idalib CLI client (manifest-driven). Talks to the worker bridge.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Run `commands` for the catalog, or read references/*.md.",
+        epilog="Run `commands` for discovery or `<command> --help` for exact parameters.",
     )
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--binary", default=None, help="Binary path (resolves worker port).")
+    common.add_argument("--binary", default=os.environ.get("IDA_BINARY"),
+                        help="Binary path (default: IDA_BINARY).")
     common.add_argument("--port", type=int, default=None, help="Direct worker port.")
     common.add_argument(
         "--output", choices=("text", "json"), default="text",
@@ -208,6 +197,32 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("commands", help="List all commands and summaries.")
     sp.add_argument("--category", default=None, help="Filter by category.")
 
+    worker = sub.add_parser("worker", help="Manage analysis workers through bridge.mjs.")
+    worker_sub = worker.add_subparsers(dest="worker_command", required=True)
+    for action in ("start", "status", "save-and-close", "close-no-save",
+                   "recover-unclosed-database", "clear-stale-read-only"):
+        wsp = worker_sub.add_parser(action)
+        wsp.add_argument("--binary", default=os.environ.get("IDA_BINARY"), required=False,
+                         help="Binary path (default: IDA_BINARY).")
+        if action == "start":
+            wsp.add_argument("--idle", type=int)
+            wsp.add_argument("--autosave", type=int)
+            wsp.add_argument("--timeout", type=int)
+            wsp.add_argument("--multi-agent", action="store_true")
+            wsp.add_argument("--read-only", action="store_true")
+            analysis = wsp.add_mutually_exclusive_group()
+            analysis.add_argument("--run-auto-analysis", dest="auto_analysis",
+                                  action="store_true", default=None)
+            analysis.add_argument("--no-run-auto-analysis", dest="auto_analysis",
+                                  action="store_false")
+        elif action in ("save-and-close", "close-no-save", "recover-unclosed-database"):
+            wsp.add_argument("--timeout", type=int, default=60,
+                             help="Seconds to wait for clean worker shutdown.")
+        elif action == "clear-stale-read-only":
+            wsp.add_argument("--source-sha256", required=True,
+                             help="Expected SHA-256 of the unchanged analysis input.")
+            wsp.add_argument("--database-sha256", required=True,
+                             help="Expected open/confirmed/current packed database SHA-256.")
     return parser
 
 
@@ -383,7 +398,40 @@ def cmd_commands(category: str | None):
             flag = "*" if c.mutates else " "
             alias = f"  (alias: {', '.join(c.aliases)})" if c.aliases else ""
             print(f" {flag} {c.name:<32} {c.summary}{alias}")
-    print("\n(* = mutates the database)")
+    print("\n(* = has side effects; inspect command help before use)")
+
+
+def cmd_worker(ns: argparse.Namespace) -> int:
+    """Forward worker lifecycle operations to the bridge implementation."""
+    node = shutil.which("node")
+    if node is None:
+        print("ERROR: node not found on PATH; cannot manage workers.", file=sys.stderr)
+        return 1
+    command = [node, str(SCRIPT_DIR / "bridge.mjs"), ns.worker_command]
+    if not ns.binary:
+        print("ERROR: --binary or IDA_BINARY is required", file=sys.stderr)
+        return 2
+    command.extend(("--binary", ns.binary))
+    if ns.worker_command == "start":
+        for name in ("idle", "autosave", "timeout"):
+            value = getattr(ns, name)
+            if value is not None:
+                command.extend((f"--{name}", str(value)))
+        if ns.multi_agent:
+            command.append("--multi-agent")
+        if ns.read_only:
+            command.append("--read-only")
+        if ns.auto_analysis is True:
+            command.append("--run-auto-analysis")
+        elif ns.auto_analysis is False:
+            command.append("--no-run-auto-analysis")
+    elif ns.worker_command in ("save-and-close", "close-no-save",
+                               "recover-unclosed-database"):
+        command.extend(("--timeout", str(ns.timeout)))
+    elif ns.worker_command == "clear-stale-read-only":
+        command.extend(("--source-sha256", ns.source_sha256,
+                        "--database-sha256", ns.database_sha256))
+    return subprocess.run(command, check=False).returncode
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -415,6 +463,9 @@ def main():
         cmd_commands(ns.category)
         return
 
+    if ns.command == "worker":
+        raise SystemExit(cmd_worker(ns))
+
     if ns.command == "call":
         args = json.loads(ns.json_args) if ns.json_args else _parse_kv(ns.kv)
         target = ns.target
@@ -424,11 +475,14 @@ def main():
         target = ns.command if ns.command == cmd.name else cmd.name
         args = _ns_to_args(ns, cmd)
 
-    port = resolve_port(ns.binary, ns.port)
+    command_manifest = getattr(ns, "_cmd", None)
+    can_auto_start = ns.command != "call" and command_manifest is not None and not command_manifest.mutates
+    port = resolve_port(ns.binary, ns.port, auto_start=can_auto_start, read_only=True)
     result = send_command(port, target, args)
     if (result.get("error_type") == "ConnectionRefused"
             and ns.binary and not ns.port
-            and _auto_start_worker(ns.binary)):
+            and can_auto_start
+            and _auto_start_worker(ns.binary, read_only=True)):
         # Worker died (idle timeout or crash) — it has been restarted; retry once.
         port = resolve_port(ns.binary, None, auto_start=False)
         result = send_command(port, target, args)
