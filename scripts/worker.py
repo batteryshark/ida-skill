@@ -340,28 +340,32 @@ def cmd_close(args: dict) -> dict:
     except Exception as e:  # noqa: BLE001
         log.exception("Error closing database")
         raise IDAError(f"Error closing database: {e}", "CloseFailed")
-    finally:
-        ida_session.current_path = None
-        ida_session.capabilities = {}
-        _mark_saved()
+    ida_session.current_path = None
+    ida_session.capabilities = {}
+    _mark_saved()
     return {"status": "closed", "path": path, "saved": save}
 
 
 def cmd_save(args: dict) -> dict:
     """Save the database (close+reopen without re-analysis to flush to disk)."""
     import idapro
+    import ida_loader
 
     if not is_open():
         raise IDAError("No database open", "NoDatabase")
     path = ida_session.current_path
+    database_path = ida_loader.get_path(ida_loader.PATH_TYPE_IDB)
+    if not database_path:
+        raise IDAError("Cannot save without a database path", "SaveFailed")
     idapro.close_database(True)
     ida_session.current_path = None
-    rc = idapro.open_database(path, False)
+    ida_session.capabilities = {}
+    _mark_saved()
+    rc = idapro.open_database(database_path, False)
     if rc != 0:
         raise IDAError(f"Database saved but failed to reopen (error code {rc})", "SaveReopenFailed")
     ida_session.current_path = path
     ida_session.capabilities = _probe_capabilities()
-    _mark_saved()
     return {"status": "saved", "path": path}
 
 
