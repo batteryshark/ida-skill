@@ -123,6 +123,7 @@ def _register_windows_license():
 # Imports that require ida_cmd/ida_helpers/handlers on sys.path (safe — they
 # lazy-import ida_* internally, so this does not touch idapro yet).
 from ida_cmd import IDAError  # noqa: E402
+from ida_helpers import probe_capabilities as _probe_capabilities  # noqa: E402
 from ida_helpers import session as ida_session  # noqa: E402
 import handlers  # noqa: E402
 
@@ -288,16 +289,6 @@ _autosave = {"mutations": 0, "last_save": time.time()}
 def _mark_saved():
     _autosave["mutations"] = 0
     _autosave["last_save"] = time.time()
-
-
-def _probe_capabilities() -> dict[str, bool]:
-    import ida_hexrays
-    import ida_idp
-
-    return {
-        "decompiler": bool(ida_hexrays.init_hexrays_plugin()),
-        "assembler": ida_idp.get_idp_name() == "metapc",
-    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────

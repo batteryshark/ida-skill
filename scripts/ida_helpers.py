@@ -62,6 +62,17 @@ class _Session:
 session = _Session()
 
 
+def probe_capabilities() -> dict[str, bool]:
+    """Refresh capabilities for the database currently open in IDA."""
+    import ida_hexrays
+    import ida_idp
+
+    return {
+        "decompiler": bool(ida_hexrays.init_hexrays_plugin()),
+        "assembler": ida_idp.get_idp_name() == "metapc",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Formatting
 # ---------------------------------------------------------------------------
