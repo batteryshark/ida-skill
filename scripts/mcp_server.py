@@ -40,6 +40,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from ida_cmd import BUILTIN_COMMANDS, Command  # noqa: E402
+from worker_state import load_worker_target  # noqa: E402
 import handlers  # noqa: E402
 
 BIN_DIR = Path(os.environ.get("IDA_SKILL_BIN_DIR", SCRIPT_DIR.parent / "bin")).expanduser().resolve()
@@ -52,48 +53,39 @@ _worker_binary: str | None = None
 # ─────────────────────────────────────────────────────────────────────────────
 # Worker connection
 # ─────────────────────────────────────────────────────────────────────────────
-def resolve_port(binary: str | None = None, port: int | None = None) -> int:
+def resolve_target(binary: str | None = None, port: int | None = None) -> tuple[int, str | None]:
     selected_port = port if port is not None else _worker_port
     if selected_port is not None:
-        return selected_port
+        return selected_port, None
     if binary is None:
         binary = _worker_binary
     if binary is None:
         raise ValueError("No --binary or --port specified")
-    import hashlib
-
-    resolved = os.path.realpath(binary)
-    h = hashlib.md5(resolved.encode()).hexdigest()[:12]
-    port_file = RUNTIME_STATE / f"worker-{h}.port"
-    if not port_file.exists():
-        raise FileNotFoundError(
-            f"No worker found for {binary}. Start one with: "
-            f"node scripts/bridge.mjs start --binary '{binary}'"
-        )
-    return int(port_file.read_text().strip())
+    return load_worker_target(RUNTIME_STATE, binary)
 
 
-def send_command(port: int, cmd: str, args: dict) -> dict:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(300)
-    sock.connect(("127.0.0.1", port))
-    request = json.dumps({"cmd": cmd, "args": args}) + "\n"
-    sock.sendall(request.encode("utf-8"))
-    data = b""
-    while True:
-        chunk = sock.recv(65536)
-        if not chunk:
-            break
-        data += chunk
-        if b"\n" in data:
-            break
-    sock.close()
+def send_command(port: int, cmd: str, args: dict, session_id: str | None = None) -> dict:
+    request = {"cmd": cmd, "args": args}
+    if session_id is not None:
+        request = {"cmd": "worker-command", "args": request, "session_id": session_id}
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(300)
+        sock.connect(("127.0.0.1", port))
+        sock.sendall((json.dumps(request) + "\n").encode("utf-8"))
+        data = b""
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+            if b"\n" in data:
+                break
     return json.loads(data.decode("utf-8").strip())
 
 
 def call_worker(cmd: str, **kwargs) -> str:
-    port = resolve_port()
-    result = send_command(port, cmd, kwargs)
+    port, session_id = resolve_target()
+    result = send_command(port, cmd, kwargs, session_id)
     if result.get("status") == "error":
         detail = result.get("details")
         extra = f" {json.dumps(detail)}" if detail else ""
@@ -174,7 +166,7 @@ def main():
 
     parser = argparse.ArgumentParser(description="ida-skill MCP server")
     parser.add_argument("--binary", help="Binary path (resolves worker port)")
-    parser.add_argument("--port", type=int, help="Direct worker port")
+    parser.add_argument("--port", type=int, help="Direct worker port (without binary/session verification)")
     args = parser.parse_args()
 
     global _worker_binary, _worker_port
@@ -184,7 +176,7 @@ def main():
     register_all()
 
     try:
-        port = resolve_port(args.binary, args.port)
+        port, _session_id = resolve_target(args.binary, args.port)
         print(f"Connected to worker on port {port}", file=sys.stderr)
     except Exception as e:  # noqa: BLE001
         print(f"WARNING: {e}", file=sys.stderr)

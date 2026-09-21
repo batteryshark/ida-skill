@@ -25,6 +25,7 @@ import socketserver
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Callable
 
@@ -278,6 +279,10 @@ IDAWorkerError = IDAError
 # command), so no locking is needed.
 # ─────────────────────────────────────────────────────────────────────────────
 MULTI_AGENT = False
+WORKER_SESSION_ID = str(uuid.uuid4())
+WORKER_REQUESTED_PATH: str | None = None
+_shutdown_requested = threading.Event()
+_shutdown_response_complete = threading.Event()
 
 # Commands that operate on global database state: with concurrent clients, an
 # undo or snapshot restore would silently destroy other agents' work.
@@ -374,6 +379,30 @@ def cmd_list_commands(args: dict) -> dict:
     return {"commands": out, "count": len(out)}
 
 
+def cmd_worker_identity(args: dict) -> dict:
+    idb_path = None
+    if is_open():
+        import ida_loader
+
+        path = ida_loader.get_path(ida_loader.PATH_TYPE_IDB)
+        idb_path = os.path.realpath(path) if path else None
+    return {
+        "protocol": 1,
+        "pid": os.getpid(),
+        "session_id": WORKER_SESSION_ID,
+        "requested_path": WORKER_REQUESTED_PATH,
+        "current_path": ida_session.current_path,
+        "idb_path": idb_path,
+        "state": "stopping" if _shutdown_requested.is_set() else "ready",
+    }
+
+
+def cmd_worker_shutdown(args: dict) -> dict:
+    result = cmd_close({"save": True})
+    _shutdown_requested.set()
+    return {"status": "stopping", "session_id": WORKER_SESSION_ID, "close": result}
+
+
 _BUILTINS: dict[str, Callable[[dict], Any]] = {
     "open": cmd_open,
     "close": cmd_close,
@@ -388,8 +417,26 @@ _NO_OPEN_REQUIRED = {"open", "close", "save", "list-commands"}
 # ─────────────────────────────────────────────────────────────────────────────
 # Dispatch
 # ─────────────────────────────────────────────────────────────────────────────
-def handle_command(cmd: str, args: dict) -> dict:
+def handle_command(cmd: str, args: dict, expected_session_id: str | None = None) -> dict:
     args = args or {}
+
+    if ((expected_session_id is not None or cmd in {"worker-shutdown", "worker-command"})
+            and expected_session_id != WORKER_SESSION_ID):
+        raise IDAError("Worker session does not match the requested session", "SessionMismatch")
+    if cmd == "worker-identity":
+        return cmd_worker_identity(args)
+    if _shutdown_requested.is_set():
+        raise IDAError("Worker is stopping", "WorkerStopping")
+    if cmd == "worker-shutdown":
+        return cmd_worker_shutdown(args)
+    if cmd == "worker-command":
+        if not isinstance(args, dict) or not isinstance(args.get("cmd"), str):
+            raise IDAError("worker-command requires a command name and arguments", "InvalidArgument")
+        cmd, args = args["cmd"], args.get("args", {})
+        if not isinstance(args, dict):
+            raise IDAError("Command arguments must be an object", "InvalidArgument")
+        # Unwrap once: control RPCs cannot be nested, and legacy workers reject
+        # the outer command instead of accidentally executing a reused-port write.
 
     builtin = _BUILTINS.get(cmd)
     if builtin is not None:
@@ -444,6 +491,7 @@ class CommandHandler(socketserver.StreamRequestHandler):
                 self.tracker.end()
 
     def _handle_request(self):
+        shutdown_response = False
         try:
             line = self.rfile.readline(MAX_REQUEST_SIZE)
             if not line:
@@ -452,7 +500,8 @@ class CommandHandler(socketserver.StreamRequestHandler):
             cmd = req.get("cmd", "")
             args = req.get("args", {})
             log.debug("CMD: %s args=%s", cmd, list((args or {}).keys()))
-            result = call_ida(handle_command, cmd, args)
+            result = call_ida(handle_command, cmd, args, req.get("session_id"))
+            shutdown_response = cmd == "worker-shutdown"
             self.send_response({"status": "ok", "result": result})
         except json.JSONDecodeError as e:
             self.send_response({"status": "error", "error": f"Invalid JSON: {e}", "error_type": "JSONError"})
@@ -464,6 +513,9 @@ class CommandHandler(socketserver.StreamRequestHandler):
         except Exception as e:  # noqa: BLE001
             log.exception("Unhandled error handling command")
             self.send_response({"status": "error", "error": str(e), "error_type": type(e).__name__})
+        finally:
+            if shutdown_response:
+                _shutdown_response_complete.set()
 
     def send_response(self, resp: dict):
         data = (json.dumps(resp, default=str) + "\n").encode("utf-8")
@@ -494,6 +546,15 @@ def _cancel_handler(signum, frame):
 # ─────────────────────────────────────────────────────────────────────────────
 # Main entry point
 # ─────────────────────────────────────────────────────────────────────────────
+def _publish_port_file(path: Path, port: int) -> None:
+    temporary = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(str(port))
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def main():
     import argparse
 
@@ -501,6 +562,7 @@ def main():
     parser.add_argument("--port", type=int, default=0, help="TCP port (0=auto)")
     parser.add_argument("--port-file", required=True, help="File to write the actual port")
     parser.add_argument("--binary", required=False, help="Binary to auto-open")
+    parser.add_argument("--session-id", default=None, help="Bridge-issued worker session identity")
     analysis = parser.add_mutually_exclusive_group()
     analysis.add_argument("--run-auto-analysis", dest="run_auto_analysis", action="store_true")
     analysis.add_argument("--no-run-auto-analysis", dest="run_auto_analysis", action="store_false")
@@ -514,8 +576,12 @@ def main():
                              "that are unsafe with concurrent clients")
     args = parser.parse_args()
 
-    global MULTI_AGENT
+    global MULTI_AGENT, WORKER_SESSION_ID, WORKER_REQUESTED_PATH
     MULTI_AGENT = args.multi_agent
+    WORKER_SESSION_ID = args.session_id or str(uuid.uuid4())
+    WORKER_REQUESTED_PATH = os.path.realpath(os.path.expanduser(args.binary)) if args.binary else None
+    _shutdown_requested.clear()
+    _shutdown_response_complete.clear()
 
     _setup_environment()
     log.info("Bootstrapping idalib from %s", RUNTIME_DIR)
@@ -540,7 +606,7 @@ def main():
     # Written only after the database opened: the bridge's "Worker ready" is
     # gated on this file, and an open failure must not leave a port file
     # pointing at a worker that is about to die.
-    Path(args.port_file).write_text(str(actual_port))
+    _publish_port_file(Path(args.port_file), actual_port)
     log.info("Port file: %s", args.port_file)
 
     signal.signal(signal.SIGTERM, _terminate_handler)
@@ -560,7 +626,7 @@ def main():
              idle_label, autosave_label, MULTI_AGENT)
 
     try:
-        while True:
+        while not _shutdown_requested.is_set():
             executor.drain(timeout=1.0)
             _maybe_autosave(args.autosave, tracker, executor)
             if (args.idle_timeout > 0
@@ -572,10 +638,17 @@ def main():
     except (KeyboardInterrupt, SystemExit):
         log.info("Shutting down...")
     finally:
+        shutdown_rpc = _shutdown_requested.is_set()
+        _shutdown_requested.set()
         server.shutdown()
-        # Serve requests that were already in flight when the listener closed.
+        # Drain queued work and let the shutdown acknowledgment flush. An
+        # unrelated client that never finishes its request must not delay it.
         grace_deadline = time.monotonic() + 10
-        while (tracker.busy() or executor.pending()) and time.monotonic() < grace_deadline:
+        while time.monotonic() < grace_deadline:
+            response_pending = (not _shutdown_response_complete.is_set()
+                                if shutdown_rpc else tracker.busy())
+            if not response_pending and not executor.pending():
+                break
             executor.drain(timeout=0.5)
         executor.shutdown()
 
@@ -586,10 +659,6 @@ def main():
             except Exception:  # noqa: BLE001
                 log.exception("Failed to save database on shutdown")
 
-        try:
-            Path(args.port_file).unlink(missing_ok=True)
-        except Exception:  # noqa: BLE001
-            pass
         log.info("Worker stopped")
 
 

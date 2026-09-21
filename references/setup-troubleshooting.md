@@ -82,6 +82,24 @@ signatures remain usable.
 
 ## Troubleshooting
 
+- **Upgrading a running worker** — stop workers with the bridge version that
+  started them before upgrading. Current workers use an atomic
+  `worker-<hash>.json` record containing their PID, port, original requested
+  path and fresh session ID. Legacy PID/port files alone cannot verify an
+  owner; the current bridge refuses to attach or stop through them. The bridge
+  never sends termination signals to a recorded PID. Direct `--port` remains
+  available for deliberate compatibility use, without session verification.
+- **Identity mismatch or malformed state** — preserve the state and inspect the
+  log. A listening port and live PID do not establish that they belong to the
+  same worker. Do not rewrite the record to bypass the check. Session IDs prevent
+  accidental misrouting; they are not authentication against local programs.
+- **Lifecycle lock timeout** — starts and stops for the same requested path
+  share a lock. Wait for the owning operation. If it crashed, confirm that the
+  recorded lock owner has exited, check for a surviving worker, and ensure no
+  lifecycle commands are running before removing only the stale `.lock` file.
+  Stale locks are deliberately not reclaimed automatically: competing
+  reclaimers could otherwise remove a newly acquired lock. Leave database,
+  sidecar and worker state files intact.
 - **"Runtime not provisioned"** — run `node scripts/setup.mjs --ida-dir /path/to/ida`; add `--include-license` only for a private self-contained bundle.
 - **"No worker found for..."** — `cli.py` normally auto-starts one (the worker
   may have auto-shutdown after the idle timeout, 10 min default). If auto-start
@@ -102,8 +120,11 @@ signatures remain usable.
   let that worker finish instead of starting a second one. For a fresh start,
   allow more time with `bridge.mjs start --binary <path> --timeout 600`.
 - **Save or shutdown failure** — a failed `bridge.mjs stop` returns nonzero and
-  preserves the live worker and its state. Inspect status and the log before
-  retrying; do not force-kill a worker that may still be saving.
+  preserves its state. A save failure leaves the worker available for diagnosis;
+  if the shutdown acknowledgement was lost, it may already be exiting. Inspect
+  status and the log before retrying; do not force-kill a worker that may still
+  be saving. An already-exited worker can be cleaned up, but that alone does not
+  prove that its last save succeeded.
 - **macOS segfaults** — ensure `setup.mjs` used `ditto` (not `cp`). Re-run
   setup with `--force` (and repeat `--include-license` if wanted). Setup recursively clears the
   quarantine attribute from the locally provisioned runtime; for an existing

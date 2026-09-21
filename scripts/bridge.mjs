@@ -11,9 +11,9 @@
 //   node bridge.mjs status  --binary <path>
 //   node bridge.mjs stop-all
 
-import { createHash } from 'node:crypto';
-import { openSync, closeSync, existsSync, mkdirSync, readFileSync, writeFileSync, rmSync, readdirSync, realpathSync } from 'node:fs';
-import { join, resolve, dirname } from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
+import { openSync, closeSync, existsSync, mkdirSync, readFileSync, writeFileSync, rmSync, readdirSync, realpathSync, renameSync } from 'node:fs';
+import { join, resolve, dirname, isAbsolute, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
 import * as net from 'node:net';
@@ -42,83 +42,150 @@ const RUNTIME_DIR = resolveRuntimeDir();
 // ─────────────────────────────────────────────────────────────────────────────
 // Port / PID file management (keyed by binary path hash)
 // ─────────────────────────────────────────────────────────────────────────────
-function binaryHash(binaryPath) {
-  // Use realpath to resolve symlinks (e.g. /tmp → /private/tmp on macOS)
-  // Must match cli.py's os.path.realpath()
-  const resolved = realpathSync(binaryPath);
-  return createHash('md5').update(resolved).digest('hex').slice(0, 12);
+function pathHash(path) {
+  return createHash('md5').update(path).digest('hex').slice(0, 12);
 }
-function portFilePath(binaryPath) {
-  return join(RUNTIME_STATE, `worker-${binaryHash(binaryPath)}.port`);
+function paths(stem) {
+  return Object.fromEntries(['pid', 'port', 'json', 'log', 'lock'].map(ext => [ext, `${stem}.${ext}`]));
 }
-function pidFilePath(binaryPath) {
-  return join(RUNTIME_STATE, `worker-${binaryHash(binaryPath)}.pid`);
+function binaryPaths(binary) {
+  return paths(join(RUNTIME_STATE, `worker-${pathHash(realpathSync(binary))}`));
 }
-function logFilePath(binaryPath) {
-  return join(RUNTIME_STATE, `worker-${binaryHash(binaryPath)}.log`);
-}
-function lockFilePath(binaryPath) {
-  return join(RUNTIME_STATE, `worker-${binaryHash(binaryPath)}.lock`);
-}
-
-// Atomically claim the start lock (O_CREAT|O_EXCL). Concurrent `start`
-// invocations would otherwise both see "no worker" and spawn two idalib
-// processes on the same database. A lock whose holder PID is dead is stale
-// (crashed mid-start) and gets reclaimed.
-function tryAcquireStartLock(binaryPath) {
-  const lockFile = lockFilePath(binaryPath);
-  const claim = () => {
-    try {
-      writeFileSync(lockFile, String(process.pid), { flag: 'wx' });
-      return true;
-    } catch (e) {
-      if (e.code !== 'EEXIST') throw e;
-      return false;
-    }
-  };
-  if (claim()) return true;
-  let holder = null;
-  try { holder = parseInt(readFileSync(lockFile, 'utf8').trim(), 10); } catch {}
-  if (!isPidAlive(holder)) {
-    rmSync(lockFile, { force: true });
-    return claim();
-  }
-  return false;
-}
-
-function readPort(binaryPath) {
-  const f = portFilePath(binaryPath);
-  if (!existsSync(f)) return null;
-  const n = parseInt(readFileSync(f, 'utf8').trim(), 10);
-  return Number.isNaN(n) ? null : n;
-}
-function readPid(binaryPath) {
-  const f = pidFilePath(binaryPath);
-  if (!existsSync(f)) return null;
-  const n = parseInt(readFileSync(f, 'utf8').trim(), 10);
-  return Number.isNaN(n) ? null : n;
-}
+const delay = ms => new Promise(resolveDelay => setTimeout(resolveDelay, ms));
 function isPidAlive(pid) {
-  if (!pid) return false;
   try { process.kill(pid, 0); return true; }
   catch (error) { return error.code !== 'ESRCH'; }
 }
+function validPort(port) {
+  return Number.isSafeInteger(port) && port > 0 && port <= 65535;
+}
+function readPort(p) {
+  if (!existsSync(p.port)) return null;
+  const text = readFileSync(p.port, 'utf8').trim();
+  const port = Number(text);
+  if (!/^[1-9][0-9]*$/.test(text) || !validPort(port)) throw new Error('Invalid port metadata; state preserved');
+  return port;
+}
+function readState(p, requestedPath) {
+  if (!existsSync(p.json)) {
+    if (existsSync(p.pid) || existsSync(p.port)) {
+      throw new Error('Legacy or incomplete worker metadata cannot verify ownership; state preserved. Stop legacy workers with the pre-upgrade bridge.');
+    }
+    return null;
+  }
+  let state;
+  try { state = JSON.parse(readFileSync(p.json, 'utf8')); }
+  catch { throw new Error(`Invalid worker state at ${p.json}; state preserved`); }
+  if (!state || state.protocol !== 1 || !Number.isSafeInteger(state.pid) || state.pid <= 0
+      || (state.port !== null && !validPort(state.port))
+      || typeof state.session_id !== 'string' || !state.session_id
+      || typeof state.requested_path !== 'string' || !isAbsolute(state.requested_path)
+      || basename(p.json) !== `worker-${pathHash(state.requested_path)}.json`
+      || (requestedPath && state.requested_path !== requestedPath)) {
+    throw new Error(`Invalid worker identity metadata at ${p.json}; state preserved`);
+  }
+  return state;
+}
+function writeState(p, state) {
+  const temporary = `${p.json}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(temporary, `${JSON.stringify(state)}\n`, { mode: 0o600 });
+    renameSync(temporary, p.json);
+  } catch (error) {
+    try { rmSync(temporary, { force: true }); } catch {}
+    throw error;
+  }
+}
+function removeSession(p, captured) {
+  const current = readState(p);
+  if (!current || current.session_id !== captured.session_id || current.pid !== captured.pid) {
+    throw new Error('Worker session changed during lifecycle operation; replacement state preserved');
+  }
+  rmSync(p.port, { force: true });
+  rmSync(p.pid, { force: true });
+  rmSync(p.json);
+}
+async function withLifecycleLock(p, timeoutSeconds, operation) {
+  mkdirSync(RUNTIME_STATE, { recursive: true });
+  const lock = { contents: JSON.stringify({ pid: process.pid, token: randomUUID() }), retain: false };
+  const deadline = Date.now() + timeoutSeconds * 1000;
+  while (true) {
+    try { writeFileSync(p.lock, lock.contents, { flag: 'wx', mode: 0o600 }); break; }
+    catch (error) { if (error.code !== 'EEXIST') throw error; }
+    if (Date.now() >= deadline) {
+      throw new Error(`Lifecycle lock still exists at ${p.lock}; state preserved. Inspect its owner before manually recovering a stale lock.`);
+    }
+    await delay(100);
+  }
+  try { return await operation(lock); }
+  finally {
+    if (!lock.retain) {
+      if (readFileSync(p.lock, 'utf8') !== lock.contents) {
+        throw new Error(`Lifecycle lock ownership changed at ${p.lock}; lock preserved`);
+      }
+      rmSync(p.lock);
+    }
+  }
+}
 function tcpProbe(port) {
-  return new Promise(r => {
-    const s = new net.Socket();
-    s.setTimeout(2000);
-    s.once('connect', () => { s.destroy(); r(true); });
-    s.once('error', () => { s.destroy(); r(false); });
-    s.once('timeout', () => { s.destroy(); r(false); });
-    s.connect(port, '127.0.0.1');
+  if (!port) return Promise.resolve(false);
+  return new Promise(resolveProbe => {
+    const socket = new net.Socket();
+    socket.setTimeout(1000);
+    socket.once('connect', () => { socket.destroy(); resolveProbe(true); });
+    socket.once('error', () => { socket.destroy(); resolveProbe(false); });
+    socket.once('timeout', () => { socket.destroy(); resolveProbe(false); });
+    socket.connect(port, '127.0.0.1');
   });
 }
-async function isWorkerRunning(binaryPath) {
-  const port = readPort(binaryPath);
-  if (!port) return false;
-  const pid = readPid(binaryPath);
-  if (!isPidAlive(pid)) return false;
-  return tcpProbe(port);
+async function request(port, cmd, sessionId, timeoutMs = 5000, args = {}) {
+  const socket = new net.Socket();
+  let deadline;
+  try {
+    return await new Promise((resolveRequest, reject) => {
+      let data = '';
+      deadline = setTimeout(() => reject(new Error(`${cmd} timed out`)), timeoutMs);
+      socket.once('connect', () => {
+        const message = { cmd, args };
+        if (sessionId !== undefined) message.session_id = sessionId;
+        socket.write(`${JSON.stringify(message)}\n`);
+      });
+      socket.on('data', chunk => {
+        data += chunk.toString();
+        const newline = data.indexOf('\n');
+        if (newline < 0) return;
+        try {
+          const response = JSON.parse(data.slice(0, newline));
+          if (response.status !== 'ok') throw new Error(response.error || `${cmd} failed`);
+          resolveRequest(response.result);
+        } catch (error) { reject(error); }
+      });
+      socket.once('error', reject);
+      socket.once('end', () => reject(new Error(`worker disconnected before acknowledging ${cmd}`)));
+      socket.once('close', () => reject(new Error(`worker connection closed before acknowledging ${cmd}`)));
+      socket.connect(port, '127.0.0.1');
+    });
+  } finally {
+    clearTimeout(deadline);
+    socket.destroy();
+  }
+}
+async function verifyIdentity(p, state, timeoutMs = 5000) {
+  if (!isPidAlive(state.pid)) throw new Error('Recorded worker PID is not alive; state preserved');
+  const port = state.port ?? readPort(p);
+  if (!port) throw new Error(`Worker ${state.pid} is still alive but not ready; state preserved`);
+  const identity = await request(port, 'worker-identity', undefined, timeoutMs);
+  if (!identity || identity.protocol !== 1 || identity.pid !== state.pid
+      || identity.session_id !== state.session_id || identity.requested_path !== state.requested_path
+      || !['ready', 'stopping'].includes(identity.state)) {
+    throw new Error('Worker identity mismatch (protocol, PID, session, or requested path); state preserved');
+  }
+  return { port, identity };
+}
+async function assertDeadAndUnreachable(p, state) {
+  if (isPidAlive(state.pid) || await tcpProbe(state.port ?? readPort(p))) {
+    throw new Error('Worker PID or endpoint is still active; state preserved');
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -142,8 +209,7 @@ function findPython() {
       }
     } catch {}
   }
-  console.error('ERROR: Python 3 not found. Install python3 and ensure it is on PATH.');
-  process.exit(1);
+  throw new Error('Python 3 not found. Install python3 and ensure it is on PATH.');
 }
 
 function validateRuntime() {
@@ -177,281 +243,131 @@ function validateBinary(binaryPath) {
 async function cmdStart(opts) {
   validateRuntime();
   validateBinary(opts.binary);
-  mkdirSync(RUNTIME_STATE, { recursive: true });
-
-  if (await isWorkerRunning(opts.binary)) {
-    const port = readPort(opts.binary);
-    console.log(`Worker already running (port ${port}).`);
-    return;
-  }
-
-  const timeoutMs = (opts.timeout || 300) * 1000;
-  let acquired = tryAcquireStartLock(opts.binary);
-  if (!acquired) {
-    // Another process is starting this worker — wait for its result instead
-    // of racing it onto the same database.
-    console.log('Another start is already in progress for this binary; waiting...');
-    const waitStart = Date.now();
-    while (!acquired && Date.now() - waitStart < timeoutMs) {
-      if (await isWorkerRunning(opts.binary)) {
-        console.log(`Worker ready on port ${readPort(opts.binary)} (started by another process).`);
+  const requestedPath = realpathSync(opts.binary);
+  const p = binaryPaths(opts.binary);
+  await withLifecycleLock(p, opts.timeout ?? 300, async lock => {
+    let state = readState(p, requestedPath);
+    if (state) {
+      if (isPidAlive(state.pid)) {
+        const { port, identity } = await verifyIdentity(p, state, (opts.timeout ?? 300) * 1000);
+        if (identity.state !== 'ready') throw new Error('Worker is stopping; state preserved');
+        if (state.port === null) writeState(p, { ...state, port });
+        console.log(`Worker already running (port ${port}).`);
         return;
       }
-      acquired = tryAcquireStartLock(opts.binary);
-      if (!acquired) await new Promise(r => setTimeout(r, 1000));
+      await assertDeadAndUnreachable(p, state);
+      removeSession(p, state);
     }
-    if (!acquired) {
-      console.error(`Timed out waiting for the concurrent start. Stale lock? ${lockFilePath(opts.binary)}`);
-      process.exit(1);
+
+    const python = findPython();
+    const sessionId = randomUUID();
+    const workerArgs = [
+      join(__dirname, 'worker.py'), '--port', '0', '--port-file', p.port,
+      '--binary', requestedPath, '--session-id', sessionId,
+      '--idle-timeout', String(opts.idle ?? 600),
+    ];
+    if (opts.autoAnalysis === false) workerArgs.push('--no-run-auto-analysis');
+    if (opts.autosave !== undefined) workerArgs.push('--autosave', String(opts.autosave));
+    if (opts.multiAgent) workerArgs.push('--multi-agent');
+    const childEnv = { ...process.env, IDA_RUNTIME_DIR: RUNTIME_DIR };
+    if (process.platform === 'linux') {
+      childEnv.LD_LIBRARY_PATH = [RUNTIME_DIR, join(RUNTIME_DIR, 'plugins'), process.env.LD_LIBRARY_PATH].filter(Boolean).join(':');
     }
-    // Lock taken over from a holder that died/finished without a worker.
-    if (await isWorkerRunning(opts.binary)) {
-      rmSync(lockFilePath(opts.binary), { force: true });
-      console.log(`Worker already running (port ${readPort(opts.binary)}).`);
-      return;
+    const logFd = openSync(p.log, 'w');
+    let child;
+    try { child = spawn(python.command, workerArgs, { env: childEnv, stdio: ['ignore', logFd, logFd], detached: true }); }
+    finally { closeSync(logFd); }
+    await new Promise((resolveSpawn, reject) => { child.once('spawn', resolveSpawn); child.once('error', reject); });
+    child.unref();
+    state = { protocol: 1, pid: child.pid, port: null, session_id: sessionId, requested_path: requestedPath };
+    try { writeState(p, state); }
+    catch (error) {
+      // A durable PID-only marker blocks another start. If even that fails,
+      // retain our lock so an untracked live worker cannot be duplicated.
+      try { writeFileSync(p.pid, String(child.pid)); }
+      catch { lock.retain = true; }
+      throw new Error(`Could not publish worker state: ${error.message}; live worker PID ${child.pid}, session ${sessionId}, log ${p.log}; ${lock.retain ? 'lifecycle lock retained for manual recovery' : 'PID metadata preserved'}`);
     }
-  }
-  // Release the lock on every exit path, including process.exit().
-  process.on('exit', () => { try { rmSync(lockFilePath(opts.binary), { force: true }); } catch {} });
-
-  const previousPid = readPid(opts.binary);
-  if (isPidAlive(previousPid)) {
-    throw new Error(`Worker ${previousPid} is still alive but not ready; state preserved. Check log: ${logFilePath(opts.binary)}`);
-  }
-
-  // Clean stale files
-  rmSync(portFilePath(opts.binary), { force: true });
-  rmSync(pidFilePath(opts.binary), { force: true });
-
-  const portFile = portFilePath(opts.binary);
-  const logFile = logFilePath(opts.binary);
-  const python = findPython();
-  const workerScript = join(__dirname, 'worker.py');
-
-  const workerArgs = [
-    workerScript,
-    '--port', '0',  // auto-assign
-    '--port-file', portFile,
-    '--binary', opts.binary,
-  ];
-  if (opts.autoAnalysis === false) {
-    workerArgs.push('--no-run-auto-analysis');
-  }
-  const idleTimeout = opts.idle ?? 600;
-  workerArgs.push('--idle-timeout', String(idleTimeout));
-  if (opts.autosave !== undefined) {
-    workerArgs.push('--autosave', String(opts.autosave));
-  }
-  if (opts.multiAgent) {
-    workerArgs.push('--multi-agent');
-  }
-
-  // Build the child process environment
-  const childEnv = { ...process.env, IDA_RUNTIME_DIR: RUNTIME_DIR };
-
-  // Linux: libidalib.so and the _ida_*.so modules have RUNPATH=$ORIGIN but
-  // some sub-modules (e.g. plugins/*.so) reference siblings that need
-  // LD_LIBRARY_PATH to resolve. This must be set before Python starts —
-  // os.environ['LD_LIBRARY_PATH'] from within Python is too late (ld.so
-  // reads it only at process start).
-  if (process.platform === 'linux') {
-    const libPaths = [RUNTIME_DIR, join(RUNTIME_DIR, 'plugins')];
-    childEnv.LD_LIBRARY_PATH = libPaths.join(':')
-      + (process.env.LD_LIBRARY_PATH ? ':' + process.env.LD_LIBRARY_PATH : '');
-  }
-
-  const logFd = openSync(logFile, 'w');
-  const child = spawn(python.command, workerArgs, {
-    env: childEnv,
-    stdio: ['ignore', logFd, logFd],
-    detached: true,
-  });
-  closeSync(logFd);
-  child.unref();
-
-  writeFileSync(pidFilePath(opts.binary), String(child.pid));
-
-  console.log(`Starting worker for ${opts.binary}`);
-  console.log(`  PID: ${child.pid}`);
-  console.log(`  Python: ${python.version} (${python.command})`);
-  console.log(`  Log: ${logFile}`);
-  console.log('Waiting for ready signal...');
-
-  // Poll for the port file
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    const port = readPort(opts.binary);
-    if (port !== null) {
-      if (await tcpProbe(port)) {
-        console.log(`\nWorker ready on port ${port}.`);
-        console.log(`  cli.py <cmd> --binary "${opts.binary}"`);
-        return;
-      }
-    }
-    if (child.exitCode !== null) {
-      console.error(`\nWorker exited with code ${child.exitCode}. Check log: ${logFile}`);
-      rmSync(portFilePath(opts.binary), { force: true });
-      rmSync(pidFilePath(opts.binary), { force: true });
-      process.exit(1);
-    }
-    process.stdout.write('.');
-    await new Promise(r => setTimeout(r, 1000));
-  }
-  console.error(`\nTimeout after ${opts.timeout || 300}s. Check log: ${logFile}`);
-  console.error(`Worker ${child.pid} and its state were preserved; analysis may still be running.`);
-  process.exit(1);
-}
-
-async function requestDatabaseClose(port, timeoutMs = 300000) {
-  if (!port) throw new Error('No worker RPC port recorded');
-  const sock = new net.Socket();
-  let deadline;
-  try {
-    await new Promise((resolve, reject) => {
-      let data = '';
-      deadline = setTimeout(() => reject(new Error('database save timed out')), timeoutMs);
-      sock.once('connect', () => {
-        sock.write(JSON.stringify({ cmd: 'close', args: { save: true } }) + '\n');
-      });
-      sock.on('data', chunk => {
-        data += chunk.toString();
-        if (!data.includes('\n')) return;
-        try {
-          const response = JSON.parse(data.slice(0, data.indexOf('\n')));
-          if (response.status !== 'ok') reject(new Error(response.error || 'database close failed'));
-          else resolve();
-        } catch (error) {
-          reject(error);
-        }
-      });
-      sock.once('error', reject);
-      sock.once('end', () => reject(new Error('worker disconnected before acknowledging database close')));
-      sock.once('close', () => reject(new Error('worker connection closed before acknowledging database close')));
-      sock.connect(port, '127.0.0.1');
-    });
-    return true;
-  } finally {
-    clearTimeout(deadline);
-    sock.destroy();
-  }
-}
-
-async function stopWorker(port, pid, timeoutSeconds) {
-  if (pid !== null && (!Number.isSafeInteger(pid) || pid <= 0)) {
-    throw new Error('Invalid worker PID; state preserved');
-  }
-  if (!pid && port) throw new Error('No worker PID recorded; state preserved');
-  if (!isPidAlive(pid)) return;
-  try {
-    await requestDatabaseClose(port, (timeoutSeconds ?? 300) * 1000);
-    if (isPidAlive(pid)) {
-      try { process.kill(pid, 'SIGTERM'); }
-      catch (error) { if (error.code !== 'ESRCH') throw error; }
-    }
-    const deadline = Date.now() + (timeoutSeconds ?? 30) * 1000;
+    writeFileSync(p.pid, String(child.pid));
+    console.log(`Starting worker for ${requestedPath}\n  PID: ${child.pid}\n  Python: ${python.version} (${python.command})\n  Log: ${p.log}`);
+    const deadline = Date.now() + (opts.timeout ?? 300) * 1000;
     while (Date.now() < deadline) {
-      if (!isPidAlive(pid)) break;
-      await new Promise(resolve => setTimeout(resolve, 100));
+      if (child.exitCode !== null || child.signalCode !== null || !isPidAlive(child.pid)) {
+        throw new Error(`Worker exited before readiness; state and log preserved at ${p.log}`);
+      }
+      if (readPort(p) !== null) {
+        const { port, identity } = await verifyIdentity(p, state, Math.max(1, deadline - Date.now()));
+        if (identity.state !== 'ready') throw new Error('New worker is stopping; state preserved');
+        writeState(p, { ...state, port });
+        console.log(`Worker ready on port ${port}.`);
+        return;
+      }
+      await delay(100);
     }
-    if (isPidAlive(pid)) throw new Error('worker did not exit after database close');
-  } catch (error) {
-    throw new Error(`Could not stop worker ${pid}: ${error.message}; process and state preserved`);
-  }
+    throw new Error(`Startup timed out; worker ${child.pid} and its state were preserved. Check log: ${p.log}`);
+  });
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// stop
-// ─────────────────────────────────────────────────────────────────────────────
+async function stopSession(p, opts, requestedPath) {
+  await withLifecycleLock(p, opts.timeout ?? 300, async () => {
+    const state = readState(p, requestedPath);
+    if (!state) return;
+    if (isPidAlive(state.pid)) {
+      const { port, identity } = await verifyIdentity(p, state, (opts.timeout ?? 300) * 1000);
+      if (identity.state === 'ready') {
+        const receipt = await request(port, 'worker-shutdown', state.session_id, (opts.timeout ?? 300) * 1000);
+        if (!receipt || receipt.status !== 'stopping' || receipt.session_id !== state.session_id) {
+          throw new Error('Worker shutdown acknowledgement did not match the session; state preserved');
+        }
+      }
+      const deadline = Date.now() + (opts.timeout ?? 30) * 1000;
+      while (isPidAlive(state.pid) && Date.now() < deadline) await delay(100);
+      if (isPidAlive(state.pid)) throw new Error(`Worker ${state.pid} did not exit after shutdown; process and state preserved`);
+    }
+    await assertDeadAndUnreachable(p, state);
+    removeSession(p, state);
+  });
+}
 async function cmdStop(opts) {
-  const port = readPort(opts.binary);
-  const pid = readPid(opts.binary);
-
-  await stopWorker(port, pid, opts.timeout);
-
-  rmSync(portFilePath(opts.binary), { force: true });
-  rmSync(pidFilePath(opts.binary), { force: true });
+  await stopSession(binaryPaths(opts.binary), opts, realpathSync(opts.binary));
   console.log('Worker stopped.');
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// stop-all
-// ─────────────────────────────────────────────────────────────────────────────
 async function cmdStopAll(opts) {
   mkdirSync(RUNTIME_STATE, { recursive: true });
-  const files = [...new Set(readdirSync(RUNTIME_STATE)
-    .filter(f => f.startsWith('worker-') && (f.endsWith('.port') || f.endsWith('.pid')))
-    .map(f => f.replace(/\.(port|pid)$/, '')))];
-  if (files.length === 0) {
-    console.log('No workers running.');
-    return;
-  }
+  const stems = [...new Set(readdirSync(RUNTIME_STATE)
+    .filter(name => /^worker-[0-9a-f]{12}\.(json|pid|port|lock)$/.test(name))
+    .map(name => name.replace(/\.(json|pid|port|lock)$/, '')))];
   let stopped = 0;
   let failed = 0;
-  for (const f of files) {
-    const portFile = join(RUNTIME_STATE, `${f}.port`);
-    const pidFile = join(RUNTIME_STATE, `${f}.pid`);
-    const port = existsSync(portFile) ? parseInt(readFileSync(portFile, 'utf8').trim(), 10) : null;
-    const pidStr = existsSync(pidFile) ? readFileSync(pidFile, 'utf8').trim() : null;
-    const pid = pidStr ? parseInt(pidStr, 10) : null;
-
-    try {
-      await stopWorker(port, pid, opts.timeout);
-    } catch (error) {
-      console.error(`ERROR: ${error.message}`);
-      failed++;
-      continue;
-    }
-    rmSync(portFile, { force: true });
-    rmSync(pidFile, { force: true });
-    stopped++;
-    console.log(`Stopped worker (port ${port}, pid ${pid}).`);
+  for (const stem of stems) {
+    try { await stopSession(paths(join(RUNTIME_STATE, stem)), opts); stopped++; }
+    catch (error) { console.error(`ERROR: ${error.message}`); failed++; }
   }
   console.log(`${stopped} worker(s) stopped.`);
   if (failed) throw new Error(`${failed} worker(s) could not be stopped; their state was preserved`);
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// status
-// ─────────────────────────────────────────────────────────────────────────────
 async function cmdStatus(opts) {
-  const port = readPort(opts.binary);
-  const pid = readPid(opts.binary);
-  const alive = pid !== null && isPidAlive(pid);
-  const reachable = port !== null && alive && await tcpProbe(port);
-
-  // Also query the worker for database info
-  let dbInfo = null;
-  if (reachable) {
-    try {
-      const sock = new net.Socket();
-      sock.setTimeout(5000);
-      dbInfo = await new Promise((res, rej) => {
-        let data = '';
-        sock.once('connect', () => {
-          sock.write(JSON.stringify({ cmd: 'info', args: {} }) + '\n');
-        });
-        sock.on('data', d => {
-          data += d.toString();
-          if (data.includes('\n')) {
-            try { res(JSON.parse(data.trim())); } catch { res(null); }
-            sock.destroy();
-          }
-        });
-        sock.once('error', rej);
-        sock.once('timeout', () => { sock.destroy(); rej(new Error('timeout')); });
-        sock.connect(port, '127.0.0.1');
-      });
-    } catch { /* ignore */ }
-  }
-
-  console.log(JSON.stringify({
-    running: reachable,
-    pid,
-    port,
-    pid_alive: alive,
-    port_reachable: reachable,
-    database: dbInfo?.result || null,
-  }, null, 2));
+  const p = binaryPaths(opts.binary);
+  const result = { running: false, identity_verified: false, pid: null, port: null, pid_alive: false, port_reachable: false, identity: null, database: null, error: null };
+  try {
+    const state = readState(p, realpathSync(opts.binary));
+    if (state) {
+      result.pid = state.pid;
+      result.port = state.port ?? readPort(p);
+      result.pid_alive = isPidAlive(state.pid);
+      result.port_reachable = await tcpProbe(result.port);
+      const { port, identity } = await verifyIdentity(p, state, Math.min(5000, (opts.timeout ?? 5) * 1000));
+      if (readState(p)?.session_id !== state.session_id) throw new Error('Worker session changed during status');
+      result.identity = identity;
+      result.identity_verified = true;
+      result.running = identity.state === 'ready';
+      if (result.running) {
+        try { result.database = await request(port, 'worker-command', state.session_id, Math.min(5000, (opts.timeout ?? 5) * 1000), { cmd: 'info', args: {} }); }
+        catch (error) { result.error = error.message; }
+      }
+    }
+  } catch (error) { result.error = error.message; }
+  console.log(JSON.stringify(result, null, 2));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

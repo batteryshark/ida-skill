@@ -33,6 +33,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from ida_cmd import BUILTIN_COMMANDS, Command, Param  # noqa: E402
+from worker_state import WorkerNotReady, load_worker_target  # noqa: E402
 import handlers  # noqa: E402
 
 BIN_DIR = Path(os.environ.get("IDA_SKILL_BIN_DIR", SCRIPT_DIR.parent / "bin")).expanduser().resolve()
@@ -68,46 +69,46 @@ def _auto_start_worker(binary_path: str) -> bool:
     return proc.returncode == 0
 
 
-def resolve_port(binary_path: str | None, explicit_port: int | None = None,
-                 auto_start: bool = True) -> int:
-    if explicit_port:
-        return explicit_port
+def resolve_target(binary_path: str | None, explicit_port: int | None = None,
+                   auto_start: bool = True) -> tuple[int, str | None]:
+    if explicit_port is not None:
+        return explicit_port, None
     if not binary_path:
         print("ERROR: --binary or --port is required", file=sys.stderr)
         sys.exit(1)
 
-    import hashlib
-
-    resolved = os.path.realpath(binary_path)
-    h = hashlib.md5(resolved.encode()).hexdigest()[:12]
-    port_file = RUNTIME_STATE / f"worker-{h}.port"
-    if not port_file.exists() and auto_start:
-        _auto_start_worker(binary_path)
-    if not port_file.exists():
-        print(f"ERROR: No worker found for {binary_path}", file=sys.stderr)
-        print(f"  Port file not found: {port_file}", file=sys.stderr)
-        print(f"  Start a worker: node scripts/bridge.mjs start --binary '{binary_path}'", file=sys.stderr)
-        sys.exit(1)
-    return int(port_file.read_text().strip())
-
-
-def send_command(port: int, cmd: str, args: dict) -> dict:
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(300)
-        sock.connect(("127.0.0.1", port))
-        request = json.dumps({"cmd": cmd, "args": args}) + "\n"
-        sock.sendall(request.encode("utf-8"))
+        try:
+            return load_worker_target(RUNTIME_STATE, binary_path)
+        except WorkerNotReady:
+            if auto_start and _auto_start_worker(binary_path):
+                return load_worker_target(RUNTIME_STATE, binary_path)
+            raise
+    except (OSError, ValueError, WorkerNotReady) as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        sys.exit(1)
 
-        data = b""
-        while True:
-            chunk = sock.recv(65536)
-            if not chunk:
-                break
-            data += chunk
-            if b"\n" in data:
-                break
-        sock.close()
+
+def send_command(port: int, cmd: str, args: dict, session_id: str | None = None) -> dict:
+    try:
+        request = {"cmd": cmd, "args": args}
+        if session_id is not None:
+            # A legacy worker must reject this internal command rather than
+            # silently ignore the session field and execute a misrouted edit.
+            request = {"cmd": "worker-command", "args": request, "session_id": session_id}
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(300)
+            sock.connect(("127.0.0.1", port))
+            sock.sendall((json.dumps(request) + "\n").encode("utf-8"))
+
+            data = b""
+            while True:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+                if b"\n" in data:
+                    break
         if not data:
             return {"status": "error", "error": "Empty response from worker", "error_type": "EmptyResponse"}
         return json.loads(data.decode("utf-8").strip())
@@ -160,7 +161,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--binary", default=None, help="Binary path (resolves worker port).")
-    common.add_argument("--port", type=int, default=None, help="Direct worker port.")
+    common.add_argument("--port", type=int, default=None,
+                        help="Direct worker port (without binary/session verification).")
     common.add_argument(
         "--output", choices=("text", "json"), default="text",
         help="Output format for the command result (default: compact text). "
@@ -408,14 +410,14 @@ def main():
         target = ns.command if ns.command == cmd.name else cmd.name
         args = _ns_to_args(ns, cmd)
 
-    port = resolve_port(ns.binary, ns.port)
-    result = send_command(port, target, args)
+    port, session_id = resolve_target(ns.binary, ns.port)
+    result = send_command(port, target, args, session_id)
     if (result.get("error_type") == "ConnectionRefused"
             and ns.binary and not ns.port
             and _auto_start_worker(ns.binary)):
         # Worker died (idle timeout or crash) — it has been restarted; retry once.
-        port = resolve_port(ns.binary, None, auto_start=False)
-        result = send_command(port, target, args)
+        port, session_id = resolve_target(ns.binary, None, auto_start=False)
+        result = send_command(port, target, args, session_id)
     print_result(result, getattr(ns, "raw", False), getattr(ns, "output", "text"))
 
 

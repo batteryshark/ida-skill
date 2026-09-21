@@ -38,6 +38,8 @@ python3 scripts/cli.py call get-xrefs-to address=main --binary "$B"
 `IDA_SKILL_NO_AUTOSTART=1` is set. Commands accept `--binary <path>` or an
 explicit `--port <n>`. Auto-start opens a normal writable database and runs
 analysis; a query-only task does not imply an enforced read-only session.
+Prefer `--binary`: it verifies the recorded worker session on every command.
+Explicit `--port` uses the direct protocol without that verification.
 
 Use `commands --category <name>` for targeted discovery and `<command> --help`
 for exact parameters. The [generated command index](references/commands.md) is
@@ -75,9 +77,10 @@ node scripts/bridge.mjs stop --binary "$B"
 ```
 
 Wait for "Worker ready"; initial analysis can take minutes. Repeated `start`
-attaches to a running worker, and a lock serializes simultaneous starts for the
-same path. A live worker that is not yet responsive must be inspected before
-another is started.
+attaches to a verified worker session, and a lock serializes starts and stops
+for the same path. A live worker that is not yet responsive must be inspected
+before another is started. The session is bound to its original requested path;
+an explicit `open` can change the database that session currently holds.
 
 Workers periodically save pending edits and exit after ten idle minutes
 (`--autosave 300`, `--idle 600`; zero disables either). Autosave measures time
@@ -85,7 +88,8 @@ since the last save and may defer during active work up to twice its interval.
 Use `save` for meaningful checkpoints. It saves and reopens the actual IDA
 database without reanalysis; the worker remains available afterward.
 
-Finish a session you own with `bridge.mjs stop`, which saves before stopping.
+Finish a session you own with `bridge.mjs stop`, which asks the verified worker
+to save and exit. After saving succeeds, it rejects further work.
 Keep a shared worker running while other clients still need it. `stop-all`
 attempts every tracked worker and reports failures, including a worker still
 starting without an RPC port. Failed saves or shutdowns return

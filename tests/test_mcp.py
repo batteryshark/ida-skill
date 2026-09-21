@@ -49,7 +49,17 @@ class McpPortTests(unittest.TestCase):
             result = json.loads(MCP.call_worker("get-database-info"))
 
         self.assertEqual({"path": "fixture.bin"}, result)
-        send.assert_called_once_with(43123, "get-database-info", {})
+        send.assert_called_once_with(43123, "get-database-info", {}, None)
+
+    def test_binary_mode_resolves_session_each_call(self):
+        MCP._worker_port = None
+        MCP._worker_binary = "fixture.bin"
+        with mock.patch.object(MCP, "load_worker_target", side_effect=[(43123, "old"), (43124, "new")]), \
+                mock.patch.object(MCP, "send_command", return_value={"status": "ok"}) as send:
+            MCP.call_worker("info")
+            MCP.call_worker("info")
+        self.assertEqual([mock.call(43123, "info", {}, "old"), mock.call(43124, "info", {}, "new")],
+                         send.call_args_list)
 
     def test_port_only_mode_can_report_worker_status(self):
         MCP._worker_port = 43123
