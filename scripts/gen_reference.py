@@ -104,7 +104,7 @@ def main() -> None:
     lines.append("python3 scripts/cli.py <command> [args] --binary <path>")
     lines.append("python3 scripts/cli.py call <command> key=value ... --binary <path>  # passthrough")
     lines.append("```")
-    lines.append("`*` marks commands that modify the database.\n")
+    lines.append("`*` marks commands that may modify the database or have other side effects.\n")
 
     ordered = [c for c in CATEGORY_ORDER if c in by_cat]
     ordered += [c for c in sorted(by_cat) if c not in CATEGORY_ORDER]
