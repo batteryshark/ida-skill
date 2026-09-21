@@ -1,7 +1,8 @@
 # Navigation — Read-Only Exploration
 
 All commands take `--binary <path>` (resolves the worker port) or `--port <n>`.
-Output defaults to compact text; add `--output json` for the structured result
+Output defaults to compact text. For programmatic consumers, set
+`IDA_SKILL_ALLOW_JSON=1` and add `--output json` for the structured result
 or `--raw` for the full envelope. Addresses accept hex
 (`0x401000`), bare hex (`4010a0`), decimal, or symbol names (`main`).
 

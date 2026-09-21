@@ -11,278 +11,117 @@ description: >
 
 # IDA Pro Reverse Engineering
 
-Use a persistent idalib worker to load each database once and serve commands
-over localhost TCP. Share one worker among concurrent clients; use a separate
-worker for each binary.
+Run commands from this skill directory. A persistent idalib worker loads each
+binary once and serializes concurrent requests on IDA's main thread. Use a
+separate worker for each binary and the same `--binary` path throughout its
+session; switching between the input and its `.i64`/`.idb` uses a different
+worker key.
 
-## Provision a private runtime
+This repository is source-only. Provision a runtime from your own licensed IDA
+installation before first use; keep copied runtimes and license state private.
+Read [setup and troubleshooting](references/setup-troubleshooting.md) for host
+requirements, provisioning options, external bundles, or worker failures.
 
-Keep this repository source-only. Do not commit or redistribute `bin/`, an IDA
-installation, a license file, EULA state, or dbgsrv binaries. Confirm that your
-Hex-Rays agreement permits every machine and location where you use a copied
-runtime.
-
-Install Node.js 22+ (Node 24 LTS recommended) and the CPython major/minor ABI
-required by your IDA build (for example, CPython 3.13 for IDA 9.4). Then copy
-from your own installation. Install `uv` only if you plan to use the optional
-MCP server.
-
-```bash
-# macOS
-node scripts/setup.mjs --ida-dir "/Applications/IDA Professional 9.4.app" --include-license
-
-# Windows
-node scripts/setup.mjs --ida-dir "C:\Path\To\IDA Professional 9.4" --include-license
-
-# Linux
-node scripts/setup.mjs --ida-dir "/opt/ida" --include-license
-```
-
-Use `--include-license` only for a private bundle. It copies `idapro.hexlic`
-and existing EULA state from the installation, the normal IDA user directory,
-or `--license-dir <path>`. Omit it to use the machine's existing IDA user
-configuration instead. On Windows, a worker with a bundled license writes the
-required per-user `EULA 90` value under HKCU; it does not require admin rights.
-
-Choose the copy size:
-
-```bash
-# Default: trim to idalib, common processors/loaders/decompilers, and dbgsrv
-node scripts/setup.mjs --ida-dir "/path/to/IDA" --include-license
-
-# Full: copy the untrimmed installation and the private license state
-node scripts/setup.mjs --ida-dir "/path/to/IDA" --include-license --full
-```
-
-The generated payload is self-contained for IDA files and license state. Node
-and an ABI-compatible Python interpreter remain host prerequisites.
-
-Provision each target from the corresponding IDA installation to assemble a
-three-platform private bundle:
-
-```bash
-node scripts/setup.mjs --ida-dir "/path/to/mac-IDA" --target-platform mac --include-license
-node scripts/setup.mjs --ida-dir "/path/to/linux-IDA" --target-platform linux --include-license
-node scripts/setup.mjs --ida-dir "/path/to/windows-IDA" --target-platform windows --include-license
-```
-
-Store payloads outside the checkout when desired:
-
-```bash
-node scripts/setup.mjs --ida-dir "/path/to/IDA" --bundle-dir "/private/ida-bundle" --include-license
-export IDA_SKILL_BIN_DIR="/private/ida-bundle"
-```
-
-In PowerShell, set `$env:IDA_SKILL_BIN_DIR = "C:\private\ida-bundle"` before
-running the bridge. Keep the same bundle root for setup, bridge, CLI, and MCP.
-
-Setup writes one runtime per target and a shared debug-server directory:
-
-```text
-bin/
-├── ida-runtime-mac/
-├── ida-runtime-windows/
-├── ida-runtime-linux/
-├── dbgsrv/
-└── runtime/                 # ephemeral worker state
-```
-
-Re-run setup safely to validate an existing runtime or refresh private license
-state. Add `--force` when changing between trimmed/full modes or replacing the
-runtime. On macOS, let setup use `ditto` and clear quarantine so copied code
-signatures remain usable.
-
-## Start the worker
-
-```bash
-# Import + analyze a binary, then start the worker
-node scripts/bridge.mjs start --binary /path/to/binary
-
-# The worker runs as a detached background process.
-# It auto-shuts down after 10 min idle (configurable: --idle 600, --idle 0 to disable)
-# Unsaved changes are flushed to disk 5 min after they accumulate
-# (configurable: --autosave 300, --autosave 0 to disable)
-
-# For orchestrated fan-out (several agents on one worker):
-node scripts/bridge.mjs start --binary /path/to/binary --multi-agent
-```
-
-Wait for the "Worker ready" message. Analysis of large binaries can take
-minutes. Changes from labeling commands are persisted by the periodic
-autosave and on graceful shutdown.
-
-Starting is idempotent and race-free: if a worker is already running, `start`
-attaches to it, and simultaneous `start` invocations are serialized through a
-lock file so only one worker ever opens a given database. `cli.py` also
-auto-starts a missing/dead worker on first use (opt out with
-`IDA_SKILL_NO_AUTOSTART=1`), so explicit `start` is only needed for
-non-default flags.
-
-## Query
-
-All commands take `--binary <path>` (resolves the worker port) or `--port <n>`.
-Output is compact, agent-readable text — the canonical format. Do not request
-JSON: `--output json` and `--raw` are disabled (they downgrade to text with a
-notice) because JSON is far more verbose for the same information. The
-`IDA_SKILL_ALLOW_JSON=1` escape hatch exists solely for scripts that must
-parse the output programmatically.
-
-The generated catalog currently contains 291 commands, including 106 debugger
-commands. They are auto-discovered from `scripts/handlers/`, and every command
-is a first-class CLI subcommand with its own `--help`. Three ways to discover
-and invoke them:
-
-```bash
-# 1. Browse the catalog (optionally by category)
-python3 scripts/cli.py commands
-python3 scripts/cli.py commands --category debug
-
-# 2. Per-command help (positional args + flags, generated from the manifest)
-python3 scripts/cli.py list-functions --help
-
-# 3. Generic passthrough for any command (no subcommand needed)
-python3 scripts/cli.py call get-xrefs-to address=main --binary $B
-```
-
-A compact index of all commands is in
-[references/commands.md](references/commands.md) (regenerate with
-`python3 scripts/gen_reference.py`); for a command's exact parameters use
-`cli.py <command> --help`. Curated workflow guides, organized by task:
-
-- **Navigation** — read-only exploration: functions, strings, xrefs, names,
-  segments, imports/exports, search, call graphs, switches, basic blocks.
-  [references/navigation.md](references/navigation.md).
-- **Decompilation** — understanding code: decompile/disassemble, ctree/AST,
-  microcode, operands, stack frames.
-  [references/decompilation.md](references/decompilation.md).
-- **Labeling** — modifying the database: rename, types, structs/enums,
-  prototypes, comments, patching/assembly, undo, snapshots.
-  [references/labeling.md](references/labeling.md).
-- **Dynamic** — the headless debugger (106 `debug-*` commands): breakpoints,
-  stepping, registers, memory, threads, modules, tracing, appcall.
-  [references/dynamic.md](references/dynamic.md).
-
-Quick reference for the most common commands (short aliases in parentheses):
+## Query and discover
 
 ```bash
 B=/path/to/binary
-
-python3 scripts/cli.py get-database-info --binary $B          # (info)
-python3 scripts/cli.py list-functions --filter_pattern decrypt --binary $B  # (functions)
-python3 scripts/cli.py decompile-function main --binary $B    # (decompile)
-python3 scripts/cli.py disassemble-function main --binary $B
-python3 scripts/cli.py get-xrefs-to main --binary $B          # (xrefs-to)
-python3 scripts/cli.py get-strings --filter_pattern password --binary $B    # (strings)
-python3 scripts/cli.py get-segments --binary $B               # (segments)
-python3 scripts/cli.py get-call-graph main --depth 2 --binary $B  # (call-graph)
+python3 scripts/cli.py get-database-info --binary "$B"
+python3 scripts/cli.py commands --category functions
+python3 scripts/cli.py decompile-function --help
+python3 scripts/cli.py decompile-function main --binary "$B"
+# Generic passthrough also accepts commands from the manifest:
+python3 scripts/cli.py call get-xrefs-to address=main --binary "$B"
 ```
 
-Disassembly prints one instruction per line as `<address>  <instruction>`.
-Other record lists use compact tables, and multiline pseudocode is emitted as
-real lines rather than JSON-escaped strings.
+`cli.py` auto-starts a missing or dead worker unless
+`IDA_SKILL_NO_AUTOSTART=1` is set. Commands accept `--binary <path>` or an
+explicit `--port <n>`. Auto-start opens a normal writable database and runs
+analysis; a query-only task does not imply an enforced read-only session.
 
-### Architecture: modular handlers + one manifest
+Use `commands --category <name>` for targeted discovery and `<command> --help`
+for exact parameters. The [generated command index](references/commands.md) is
+available when a broader map helps. Read only the workflow guide relevant to
+the task:
 
-Each command is a plain handler in `scripts/handlers/<domain>.py` that takes an
-`args` dict and returns JSON. Handlers keep their `ida_*` imports *inside*
-functions, so the command manifest (`ida_cmd.Command`/`Param`) imports without a
-running IDA — that single manifest drives the CLI, the MCP server
-(`scripts/mcp_server.py`), and the generated reference. To add a command, add a
-handler + a `Command(...)` entry; it appears everywhere automatically.
+- [Navigation](references/navigation.md): functions, strings, xrefs, imports,
+  search, call graphs, switches, and basic blocks.
+- [Decompilation](references/decompilation.md): pseudocode, disassembly, ctree,
+  microcode, operands, and stack frames.
+- [Labeling](references/labeling.md): names, types, comments, patches, assembly,
+  undo, and snapshots.
+- [Dynamic analysis](references/dynamic.md): debugger backends, remote servers,
+  breakpoints, stepping, registers, memory, and appcall.
 
-### MCP server (optional)
+Begin with database metadata and a distinctive name, string, or imported API;
+follow its xrefs and decompile the relevant functions. Use disassembly when
+pseudocode obscures instruction semantics or indirect flow. Base labels and
+types on evidence, keep uncertainty in comments, and re-decompile after edits.
+
+Compact text is the normal output: disassembly uses one instruction per line,
+record lists use tables, and pseudocode retains real line breaks. For code that
+must parse results, set `IDA_SKILL_ALLOW_JSON=1` before `--output json` or
+`--raw`; otherwise those options downgrade to text with a notice.
+
+## Worker lifecycle and persistence
+
+Use explicit startup for non-default controls:
+
+```bash
+node scripts/bridge.mjs start --binary "$B" --multi-agent
+node scripts/bridge.mjs status --binary "$B"
+python3 scripts/cli.py save --binary "$B"
+node scripts/bridge.mjs stop --binary "$B"
+```
+
+Wait for "Worker ready"; initial analysis can take minutes. Repeated `start`
+attaches to a running worker, and a lock serializes simultaneous starts for the
+same path. A live worker that is not yet responsive must be inspected before
+another is started.
+
+Workers periodically save pending edits and exit after ten idle minutes
+(`--autosave 300`, `--idle 600`; zero disables either). Autosave measures time
+since the last save and may defer during active work up to twice its interval.
+Use `save` for meaningful checkpoints. It saves and reopens the actual IDA
+database without reanalysis; the worker remains available afterward.
+
+Finish a session you own with `bridge.mjs stop`, which saves before stopping.
+Keep a shared worker running while other clients still need it. `stop-all`
+attempts every tracked worker and reports failures, including a worker still
+starting without an RPC port. Failed saves or shutdowns return
+nonzero and preserve the live worker and state for diagnosis; read
+[troubleshooting](references/setup-troubleshooting.md) before retrying. Never
+delete databases or sidecars as a generic repair step.
+
+Database patches modify IDA's view, while export/rebuild commands can write
+external files. Debugger process control, memory/register writes, and appcall
+can affect the live target. Inspect command help to understand those effects;
+the manifest's mutation marker is not a read-only enforcement boundary.
+
+## Concurrent clients
+
+Use `--multi-agent` when coordinating several agents on one database. It blocks
+`undo`, `redo`, and `restore-snapshot`, because they roll back global state.
+Startup flags apply only when creating a worker; attaching with `--multi-agent`
+does not change an existing worker's mode. Avoid global rollback whenever clients
+share a database. Assign disjoint functions or address ranges and fix mistakes
+forward. Ordinary
+single-client snapshots and undo remain available. Requests run FIFO with
+per-request results; idle shutdown waits while work is in flight or queued.
+
+## Optional MCP and command extensions
 
 After starting a worker, expose the same command manifest over MCP:
 
 ```bash
-uv run scripts/mcp_server.py --binary /path/to/binary
+uv run scripts/mcp_server.py --binary "$B"
 # Or connect directly: uv run scripts/mcp_server.py --port 62927
 ```
 
-## Stop the worker
+Handlers in `scripts/handlers/` keep IDA imports inside functions, so CLI/MCP
+schemas can load without a licensed runtime. Add a handler and `Command` entry,
+then regenerate the index with `python3 scripts/gen_reference.py`. Lifecycle
+schemas live in `scripts/ida_cmd.py` and are shared by CLI, MCP, and the index.
 
-```bash
-node scripts/bridge.mjs stop --binary /path/to/binary
-```
-
-Graceful shutdown persists any labeling changes to the `.i64` database. Use
-`status` to check liveness. To kill all workers at once: `node scripts/bridge.mjs stop-all`.
-Shutdown waits for IDA to acknowledge the database save before terminating the
-worker; large databases may take several minutes.
-
-## How it works
-
-```
-bridge.mjs start --binary /path/bin
-  → spawns: python3 worker.py --binary /path/bin
-  → worker: import idapro → open_database(auto_analysis) → serve TCP
-  → writes: bin/runtime/worker-<hash>.port
-
-cli.py functions --binary /path/bin
-  → resolves worker port from hash
-  → TCP: {"cmd": "functions", "args": {}}
-  → worker dispatches to main thread (idalib is single-threaded)
-  → returns JSON
-
-bridge.mjs stop --binary /path/bin
-  → TCP: {"cmd": "close", "args": {"save": true}}
-  → SIGTERM → worker saves database, exits
-```
-
-The worker keeps the database open in memory, avoiding IDA startup and database
-load costs between commands. Command time still depends on the operation and
-database size.
-
-**Single-database constraint:** idalib holds one database per process. Each
-binary gets its own worker. Multiple agents can share one worker (commands
-are serialized on IDA's main thread).
-
-## Multiple agents, one worker
-
-The worker accepts concurrent clients: requests are queued FIFO onto IDA's main
-thread, and each request carries its own result slot so responses cannot be
-cross-delivered. Idle shutdown does not fire while a request is in flight or
-queued.
-
-For orchestrated fan-out, start the worker with `--multi-agent`. This blocks
-`undo`, `redo`, and `restore-snapshot` (they roll back *global* database
-state — one agent's undo would silently destroy another agent's work); agents
-should fix mistakes forward by re-applying the correct label/type. Write
-conflicts are best avoided at dispatch time by giving agents disjoint address
-ranges.
-
-## Multiple binaries
-
-Each binary gets its own worker process (keyed by path hash). Start as many
-as needed concurrently; query each independently by passing the right
-`--binary`. Orphaned workers auto-shutdown after the idle timeout.
-
-## Troubleshooting
-
-- **"Runtime not provisioned"** — run `node scripts/setup.mjs --ida-dir /path/to/ida`; add `--include-license` only for a private self-contained bundle.
-- **"No worker found for..."** — `cli.py` normally auto-starts one (the worker
-  may have auto-shutdown after the idle timeout, 10 min default). If auto-start
-  is disabled or failed, run `bridge.mjs start --binary <path>` and check the log.
-- **"Connection refused"** — the worker died. Check the log at
-  `bin/runtime/worker-<hash>.log`. Restart with `bridge.mjs start`.
-- **"Out of private address space for netnodes"** — stale database files.
-  Delete the `.i64`/`.id0`/`.id1`/`.id2`/`.nam`/`.til` files next to the
-  binary and restart.
-- **Analysis timeout** — large binaries take time. Increase the startup
-  timeout: `bridge.mjs start --binary <path> --timeout 600`.
-- **macOS segfaults** — ensure `setup.mjs` used `ditto` (not `cp`). Re-run
-  setup with `--force` (and repeat `--include-license` if wanted). Setup recursively clears the
-  quarantine attribute from the locally provisioned runtime; for an existing
-  archive, rerun setup once or use
-  `xattr -dr com.apple.quarantine bin/ida-runtime-mac`.
-- **Python exits during `import idapro`** — IDA 9.4 targets CPython 3.13. The
-  bridge prefers `python3.13`; set `IDA_PYTHON=/path/to/python` to override it
-  for another IDA release.
-
-## Source license and trademarks
-
-Use the skill source under the MIT License. Preserve the upstream notice for
-handler/helper code adapted from [re-mcp](https://github.com/jtsylve/re-mcp),
-used under its MIT option. Treat IDA Pro, idalib, decompiler modules, licenses,
-and debug servers as separate proprietary Hex-Rays material. This project is
-independent and is not affiliated with or endorsed by Hex-Rays.
+The source is MIT licensed; preserve [NOTICE](NOTICE) for the adapted re-mcp
+code. IDA and Hex-Rays runtime material remains separate proprietary software.

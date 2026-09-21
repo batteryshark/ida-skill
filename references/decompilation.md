@@ -17,7 +17,8 @@ python3 scripts/cli.py decode-instructions 0x401000 --count 16 --binary $B
 `decompile-function` needs the Hex-Rays plugin (bundled in the runtime).
 `disassemble-function` and `decode-*` do not and are faster for quick looks.
 Disassembly output is one `<address>  <instruction>` pair per line by default;
-use `--output json` when a structured result is required.
+set `IDA_SKILL_ALLOW_JSON=1` and use `--output json` when code needs a
+structured result.
 
 ## Function structure
 
