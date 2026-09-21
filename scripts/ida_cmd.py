@@ -89,6 +89,20 @@ class Command:
         return [self.name, *self.aliases]
 
 
+# Lifecycle schemas shared by the CLI, MCP tools, and generated reference.
+BUILTIN_COMMANDS = [
+    Command("open", None, "lifecycle", "Open a binary/database in the worker.",
+            params=[Param("file_path", "str", required=True, positional=True,
+                          help="Path to binary or .i64/.idb."),
+                    Param("run_auto_analysis", "bool", default=True,
+                          help="Run auto-analysis on open.")]),
+    Command("close", None, "lifecycle", "Close the current database.",
+            params=[Param("save", "bool", default=True, help="Save before closing.")]),
+    Command("save", None, "lifecycle", "Flush the database to disk."),
+    Command("list-commands", None, "lifecycle", "List all commands (worker-side)."),
+]
+
+
 def build_registry(modules: list) -> dict[str, Command]:
     """Flatten each module's ``COMMANDS`` list into a name→Command mapping.
 

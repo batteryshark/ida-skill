@@ -39,7 +39,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from ida_cmd import Command, Param  # noqa: E402
+from ida_cmd import BUILTIN_COMMANDS, Command  # noqa: E402
 import handlers  # noqa: E402
 
 BIN_DIR = Path(os.environ.get("IDA_SKILL_BIN_DIR", SCRIPT_DIR.parent / "bin")).expanduser().resolve()
@@ -108,16 +108,6 @@ mcp = FastMCP("IDA Pro")
 
 _KIND_TO_TYPE = {"str": str, "int": int, "bool": bool, "hex": str, "json": Any}
 
-_BUILTIN_SPECS = [
-    Command("open", None, "lifecycle", "Open a binary/database in the worker.",
-            params=[Param("file_path", "str", required=True, help="Path to binary or .i64/.idb."),
-                    Param("run_auto_analysis", "bool", default=True, help="Run auto-analysis.")]),
-    Command("close", None, "lifecycle", "Close the current database.",
-            params=[Param("save", "bool", default=True, help="Save before closing.")]),
-    Command("save", None, "lifecycle", "Flush the database to disk."),
-    Command("list-commands", None, "lifecycle", "List all commands (worker-side)."),
-]
-
 
 def _make_tool_fn(cmd: Command):
     json_params = {p.name for p in cmd.params if p.kind == "json"}
@@ -152,7 +142,7 @@ def _make_tool_fn(cmd: Command):
 
 def register_all():
     seen: set[str] = set()
-    for cmd in _BUILTIN_SPECS + list(handlers.COMMANDS):
+    for cmd in BUILTIN_COMMANDS + list(handlers.COMMANDS):
         tool_name = cmd.name.replace("-", "_")
         if tool_name in seen:
             continue
