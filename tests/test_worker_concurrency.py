@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import sys
 import threading
 import time
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -97,6 +99,90 @@ class WorkerPolicyTests(unittest.TestCase):
                 mock.patch.object(command, "handler", return_value={"ok": True}):
             WORKER.handle_command("set-comment", {})
 
+        self.assertEqual(1, WORKER._autosave["mutations"])
+
+    def test_partial_script_failure_keeps_applied_edits_eligible_for_autosave(self):
+        fixture = SimpleNamespace(changes=[])
+        WORKER._autosave.update({"mutations": 0, "last_save": time.time() - 20})
+        code = (
+            "import ida_policy_test_fixture\n"
+            "ida_policy_test_fixture.changes.append('applied edit')\n"
+            "raise RuntimeError('failed after first edit')"
+        )
+
+        with mock.patch.dict(sys.modules, {"ida_policy_test_fixture": fixture}), \
+                mock.patch.object(WORKER, "is_open", return_value=True), \
+                mock.patch.object(WORKER, "cmd_save") as save:
+            with self.assertRaises(WORKER.IDAError) as raised:
+                WORKER.handle_command("run-script", {"code": code})
+            WORKER._maybe_autosave(10, WORKER.ActivityTracker(), WORKER.MainThreadExecutor())
+
+        self.assertEqual("ScriptError", raised.exception.error_type)
+        self.assertEqual(["applied edit"], fixture.changes)
+        self.assertEqual(1, WORKER._autosave["mutations"])
+        save.assert_called_once_with({})
+
+    def test_idc_expression_side_effect_marks_database_unsaved(self):
+        writes = []
+
+        def eval_idc(expression):
+            writes.append(expression)
+            return 1
+
+        WORKER._autosave["mutations"] = 0
+        expression = 'set_cmt(4096, "changed", 0)'
+        with mock.patch.dict(sys.modules, {"idc": SimpleNamespace(eval_idc=eval_idc)}), \
+                mock.patch.object(WORKER, "is_open", return_value=True):
+            result = WORKER.handle_command("evaluate-expression", {"expression": expression})
+
+        self.assertEqual([expression], writes)
+        self.assertEqual(1, result["result"])
+        self.assertEqual(1, WORKER._autosave["mutations"])
+
+    def test_debugger_waits_that_resume_processes_are_side_effecting(self):
+        from handlers import debug
+
+        native = SimpleNamespace(
+            WFNE_ANY=1, WFNE_CONT=2, DEC_TIMEOUT=-1,
+            wait_for_next_event=mock.Mock(return_value=-1),
+        )
+        with mock.patch.object(WORKER, "is_open", return_value=True), \
+                mock.patch.object(debug, "_ensure_ida"), \
+                mock.patch.object(debug, "_require_debugger_loaded"), \
+                mock.patch.object(debug, "ida_dbg", native), \
+                mock.patch.object(debug, "_event_summary", return_value=None), \
+                mock.patch.object(debug, "_status", return_value=SimpleNamespace(
+                    current_ip=None, process_state="suspended")):
+            for name, args in (
+                ("debug-event-wait", {"continue_process": True}),
+                ("debug-wait-until", {"event": "breakpoint", "timeout_seconds": 1}),
+            ):
+                with self.subTest(command=name):
+                    WORKER._autosave["mutations"] = 0
+                    WORKER.handle_command(name, args)
+                    flags = native.wait_for_next_event.call_args.args[0]
+                    self.assertTrue(flags & native.WFNE_CONT)
+                    self.assertEqual(1, WORKER._autosave["mutations"])
+
+    def test_process_listing_tracks_debugger_configuration_changes(self):
+        from handlers import debug
+
+        native = SimpleNamespace(
+            load_debugger=mock.Mock(return_value=True),
+            set_remote_debugger=mock.Mock(), get_processes=mock.Mock(return_value=0),
+        )
+        WORKER._autosave["mutations"] = 0
+        with mock.patch.object(WORKER, "is_open", return_value=True), \
+                mock.patch.object(debug, "_ensure_ida"), \
+                mock.patch.object(debug, "ida_dbg", native), \
+                mock.patch.object(debug, "ida_idd", SimpleNamespace(procinfo_vec_t=list)), \
+                mock.patch.object(debug, "idaapi", SimpleNamespace(cvar=SimpleNamespace(batch_mode=False))):
+            WORKER.handle_command("debug-process-list", {
+                "debugger": "gdb", "remote": True, "target_host": "localhost",
+            })
+
+        native.load_debugger.assert_called_once_with("gdb", True)
+        native.set_remote_debugger.assert_called_once_with("localhost", "", -1)
         self.assertEqual(1, WORKER._autosave["mutations"])
 
     def test_autosave_runs_only_after_mutations_age_past_interval(self):

@@ -10,7 +10,7 @@ python3 scripts/cli.py commands --category debug  # filtered live listing
 python3 scripts/cli.py <command> [args] --binary <path>
 python3 scripts/cli.py call <command> key=value ... --binary <path>  # passthrough
 ```
-`*` marks commands that modify the database.
+`*` marks commands that may modify the database or have other side effects.
 
 ## Categories
 
@@ -428,7 +428,7 @@ python3 scripts/cli.py call <command> key=value ... --binary <path>  # passthrou
 ## Utility
 
 - `convert-number`  — Convert a number between hex, decimal, octal, and binary.
-- `evaluate-expression`  — Evaluate an IDC expression and return the result.
+- `evaluate-expression`* — Evaluate an IDC expression and return the result.
 - `run-script`* — DANGEROUS: run arbitrary IDAPython (full FS/network access).
 
 
@@ -458,7 +458,7 @@ python3 scripts/cli.py call <command> key=value ... --binary <path>  # passthrou
 - `debug-decompile-current`  — Decompile the function containing the current instruction pointer.
 - `debug-detach`* — Detach from the active debuggee.
 - `debug-disassemble`  — Disassemble instructions at a runtime/static address.
-- `debug-event-wait`  — Wait for the next debugger event.
+- `debug-event-wait`* — Wait for the next debugger event.
 - `debug-exception-continue`* — Continue after the current exception as handled or unhandled.
 - `debug-exception-list`  — List debugger exception handling policies.
 - `debug-exception-set`* — Add or update one debugger exception policy.
@@ -494,7 +494,7 @@ python3 scripts/cli.py call <command> key=value ... --binary <path>  # passthrou
 - `debug-patch-instruction`* — Assemble and patch one instruction in live debuggee memory.
 - `debug-patch-list`  — List runtime patches recorded by this worker.
 - `debug-pause`* — Suspend the active debuggee.
-- `debug-process-list`  — List attachable processes known to the loaded debugger.
+- `debug-process-list`* — List attachable processes known to the loaded debugger.
 - `debug-process-options-get`  — Return IDA debugger launch/process options.
 - `debug-process-options-set`* — Set IDA debugger launch/process options without starting the process.
 - `debug-rebase-database`* — Rebase the IDA database to a runtime module base or explicit base.
@@ -539,4 +539,4 @@ python3 scripts/cli.py call <command> key=value ... --binary <path>  # passthrou
 - `debug-trace-save`* — Save IDA's trace buffer to a trace file.
 - `debug-virtual-module-add`* — Add a virtual debugger module.
 - `debug-virtual-module-delete`* — Delete a virtual debugger module by base address.
-- `debug-wait-until`  — Wait until a debugger event/address/module condition is observed.
+- `debug-wait-until`* — Wait until a debugger event/address/module condition is observed.

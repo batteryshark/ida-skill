@@ -425,10 +425,13 @@ def handle_command(cmd: str, args: dict) -> dict:
             "No database is open. Start a worker with --binary, or 'open' first.",
             "NoDatabase",
         )
-    result = command.handler(args)
-    if command.mutates:
-        _autosave["mutations"] += 1
-    return result
+    try:
+        return command.handler(args)
+    finally:
+        # A handler can apply some edits before raising; keep those edits
+        # eligible for autosave even when the overall command failed.
+        if command.mutates:
+            _autosave["mutations"] += 1
 
 
 # ─────────────────────────────────────────────────────────────────────────────

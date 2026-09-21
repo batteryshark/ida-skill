@@ -104,6 +104,7 @@ COMMANDS = [
     Command(
         "evaluate-expression", evaluate_expression, "utility",
         "Evaluate an IDC expression and return the result.",
+        mutates=True,
         params=[
             Param("expression", "str", required=True, positional=True,
                   help='IDC expression (e.g. "MinEA()", "0x1000+0x20").'),

@@ -367,7 +367,7 @@ def cmd_commands(category: str | None):
             flag = "*" if c.mutates else " "
             alias = f"  (alias: {', '.join(c.aliases)})" if c.aliases else ""
             print(f" {flag} {c.name:<32} {c.summary}{alias}")
-    print("\n(* = mutates the database)")
+    print("\n(* = may modify the database or have other side effects)")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

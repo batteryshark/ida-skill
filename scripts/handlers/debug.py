@@ -1466,7 +1466,7 @@ def register(mcp: FastMCP):
         """Return live IDA debugger state for this database."""
         return _status()
 
-    @mcp.tool(annotations=ANNO_READ_ONLY, tags={"debugger"})
+    @mcp.tool(annotations=ANNO_MUTATE, tags={"debugger"})
     @session.require_open
     def debug_wait_until(
         event: str = "",
@@ -1780,7 +1780,7 @@ def register(mcp: FastMCP):
             event=event,
         )
 
-    @mcp.tool(annotations=ANNO_READ_ONLY, tags={"debugger"})
+    @mcp.tool(annotations=ANNO_MUTATE, tags={"debugger"})
     @session.require_open
     def debug_process_list(
         debugger: str = "",
@@ -1971,7 +1971,7 @@ def register(mcp: FastMCP):
         event = _run_requests_and_wait(wait, timeout_seconds) if ok else None
         return DebugSimpleResult(status="source_step_out_requested", ok=ok, event=event)
 
-    @mcp.tool(annotations=ANNO_READ_ONLY, tags={"debugger"})
+    @mcp.tool(annotations=ANNO_MUTATE, tags={"debugger"})
     @session.require_open
     def debug_event_wait(
         timeout_seconds: int = 10,
