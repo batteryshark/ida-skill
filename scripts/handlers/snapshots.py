@@ -16,7 +16,7 @@ worker's session has no ``open``/``close`` methods, so the logic is inlined).
 from __future__ import annotations
 
 from ida_cmd import Command, Param
-from ida_helpers import IDAError, session
+from ida_helpers import IDAError, probe_capabilities, session
 
 
 def _snapshot_to_dict(snap) -> dict:
@@ -110,8 +110,14 @@ def restore_snapshot(args: dict) -> dict:
     idapro.close_database(True)
     session.current_path = None
     session.capabilities = {}
-    idapro.open_database(snap_file, False)
+    rc = idapro.open_database(snap_file, False)
+    if rc != 0:
+        raise IDAError(
+            f"Current database saved, but snapshot failed to open (error code {rc})",
+            error_type="SnapshotOpenFailed",
+        )
     session.current_path = snap_file
+    session.capabilities = probe_capabilities()
 
     return {
         "action": "restored",
