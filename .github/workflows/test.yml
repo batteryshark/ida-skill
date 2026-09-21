@@ -21,4 +21,5 @@ jobs:
           node-version: "24"
       - run: python -m unittest discover -s tests -p "test_*.py" -v
       - run: node --test tests/test_setup.mjs
+      - run: node --test tests/test_bridge.mjs
       - run: python scripts/check_public.py

@@ -101,7 +101,7 @@ function readPid(binaryPath) {
 function isPidAlive(pid) {
   if (!pid) return false;
   try { process.kill(pid, 0); return true; }
-  catch { return false; }
+  catch (error) { return error.code !== 'ESRCH'; }
 }
 function tcpProbe(port) {
   return new Promise(r => {
@@ -214,6 +214,11 @@ async function cmdStart(opts) {
   // Release the lock on every exit path, including process.exit().
   process.on('exit', () => { try { rmSync(lockFilePath(opts.binary), { force: true }); } catch {} });
 
+  const previousPid = readPid(opts.binary);
+  if (isPidAlive(previousPid)) {
+    throw new Error(`Worker ${previousPid} is still alive but not ready; state preserved. Check log: ${logFilePath(opts.binary)}`);
+  }
+
   // Clean stale files
   rmSync(portFilePath(opts.binary), { force: true });
   rmSync(pidFilePath(opts.binary), { force: true });
@@ -293,21 +298,18 @@ async function cmdStart(opts) {
     await new Promise(r => setTimeout(r, 1000));
   }
   console.error(`\nTimeout after ${opts.timeout || 300}s. Check log: ${logFile}`);
-  if (isPidAlive(child.pid)) {
-    try { process.kill(child.pid, 'SIGTERM'); } catch {}
-  }
-  rmSync(portFilePath(opts.binary), { force: true });
-  rmSync(pidFilePath(opts.binary), { force: true });
+  console.error(`Worker ${child.pid} and its state were preserved; analysis may still be running.`);
   process.exit(1);
 }
 
 async function requestDatabaseClose(port, timeoutMs = 300000) {
-  if (!port) return false;
+  if (!port) throw new Error('No worker RPC port recorded');
   const sock = new net.Socket();
-  sock.setTimeout(timeoutMs);
+  let deadline;
   try {
     await new Promise((resolve, reject) => {
       let data = '';
+      deadline = setTimeout(() => reject(new Error('database save timed out')), timeoutMs);
       sock.once('connect', () => {
         sock.write(JSON.stringify({ cmd: 'close', args: { save: true } }) + '\n');
       });
@@ -323,36 +325,38 @@ async function requestDatabaseClose(port, timeoutMs = 300000) {
         }
       });
       sock.once('error', reject);
-      sock.once('timeout', () => reject(new Error('database save timed out')));
+      sock.once('end', () => reject(new Error('worker disconnected before acknowledging database close')));
+      sock.once('close', () => reject(new Error('worker connection closed before acknowledging database close')));
       sock.connect(port, '127.0.0.1');
     });
     return true;
   } finally {
+    clearTimeout(deadline);
     sock.destroy();
   }
 }
 
-async function stopWorker(port, pid) {
-  let closed = false;
-  if (port && pid && isPidAlive(pid)) {
-    try {
-      closed = await requestDatabaseClose(port);
-    } catch (error) {
-      console.warn(`WARNING: graceful database close failed: ${error.message}`);
-    }
+async function stopWorker(port, pid, timeoutSeconds) {
+  if (pid !== null && (!Number.isSafeInteger(pid) || pid <= 0)) {
+    throw new Error('Invalid worker PID; state preserved');
   }
-  if (pid && isPidAlive(pid)) {
-    try { process.kill(pid, 'SIGTERM'); } catch {}
-    for (let i = 0; i < 60; i++) {
+  if (!pid && port) throw new Error('No worker PID recorded; state preserved');
+  if (!isPidAlive(pid)) return;
+  try {
+    await requestDatabaseClose(port, (timeoutSeconds ?? 300) * 1000);
+    if (isPidAlive(pid)) {
+      try { process.kill(pid, 'SIGTERM'); }
+      catch (error) { if (error.code !== 'ESRCH') throw error; }
+    }
+    const deadline = Date.now() + (timeoutSeconds ?? 30) * 1000;
+    while (Date.now() < deadline) {
       if (!isPidAlive(pid)) break;
-      await new Promise(resolve => setTimeout(resolve, 500));
+      await new Promise(resolve => setTimeout(resolve, 100));
     }
+    if (isPidAlive(pid)) throw new Error('worker did not exit after database close');
+  } catch (error) {
+    throw new Error(`Could not stop worker ${pid}: ${error.message}; process and state preserved`);
   }
-  if (pid && isPidAlive(pid)) {
-    console.warn(`WARNING: worker ${pid} did not exit; forcing termination.`);
-    try { process.kill(pid, 'SIGKILL'); } catch {}
-  }
-  return closed;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -362,7 +366,7 @@ async function cmdStop(opts) {
   const port = readPort(opts.binary);
   const pid = readPid(opts.binary);
 
-  await stopWorker(port, pid);
+  await stopWorker(port, pid, opts.timeout);
 
   rmSync(portFilePath(opts.binary), { force: true });
   rmSync(pidFilePath(opts.binary), { force: true });
@@ -372,28 +376,38 @@ async function cmdStop(opts) {
 // ─────────────────────────────────────────────────────────────────────────────
 // stop-all
 // ─────────────────────────────────────────────────────────────────────────────
-async function cmdStopAll() {
+async function cmdStopAll(opts) {
   mkdirSync(RUNTIME_STATE, { recursive: true });
-  const files = readdirSync(RUNTIME_STATE).filter(f => f.startsWith('worker-') && f.endsWith('.port'));
+  const files = [...new Set(readdirSync(RUNTIME_STATE)
+    .filter(f => f.startsWith('worker-') && (f.endsWith('.port') || f.endsWith('.pid')))
+    .map(f => f.replace(/\.(port|pid)$/, '')))];
   if (files.length === 0) {
     console.log('No workers running.');
     return;
   }
   let stopped = 0;
+  let failed = 0;
   for (const f of files) {
-    const portFile = join(RUNTIME_STATE, f);
-    const pidFile = portFile.replace('.port', '.pid');
-    const port = parseInt(readFileSync(portFile, 'utf8').trim(), 10);
+    const portFile = join(RUNTIME_STATE, `${f}.port`);
+    const pidFile = join(RUNTIME_STATE, `${f}.pid`);
+    const port = existsSync(portFile) ? parseInt(readFileSync(portFile, 'utf8').trim(), 10) : null;
     const pidStr = existsSync(pidFile) ? readFileSync(pidFile, 'utf8').trim() : null;
     const pid = pidStr ? parseInt(pidStr, 10) : null;
 
-    await stopWorker(port, pid);
+    try {
+      await stopWorker(port, pid, opts.timeout);
+    } catch (error) {
+      console.error(`ERROR: ${error.message}`);
+      failed++;
+      continue;
+    }
     rmSync(portFile, { force: true });
     rmSync(pidFile, { force: true });
     stopped++;
     console.log(`Stopped worker (port ${port}, pid ${pid}).`);
   }
   console.log(`${stopped} worker(s) stopped.`);
+  if (failed) throw new Error(`${failed} worker(s) could not be stopped; their state was preserved`);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -459,31 +473,40 @@ function parseArgs() {
 }
 
 const { cmd, opts } = parseArgs();
+if (opts.timeout !== undefined && (!Number.isFinite(opts.timeout) || opts.timeout <= 0)) {
+  console.error('--timeout must be a positive number of seconds.');
+  process.exit(1);
+}
 if (cmd !== 'stop-all' && !opts.binary) {
   console.error('--binary <path> is required.');
   process.exit(1);
 }
 
-switch (cmd) {
-  case 'start':    await cmdStart(opts); break;
-  case 'stop':     await cmdStop(opts); break;
-  case 'stop-all': await cmdStopAll(); break;
-  case 'status':   await cmdStatus(opts); break;
-  default:
-    console.error('Usage: bridge.mjs <start|stop|stop-all|status> --binary <path> [options]');
-    console.error('');
-    console.error('Commands:');
-    console.error('  start     Start a worker for --binary (auto-imports + analyzes)');
-    console.error('  stop      Stop the worker and save the database');
-    console.error('  stop-all  Stop all running workers');
-    console.error('  status    Check if worker is running and get database info');
-    console.error('');
-    console.error('Options:');
-    console.error('  --binary <path>          Binary file to analyze');
-    console.error('  --idle <sec>             Idle auto-shutdown timeout (default: 600, 0=disable)');
-    console.error('  --autosave <sec>         Save this long after unsaved changes accumulate (default: 300, 0=disable)');
-    console.error('  --multi-agent            Block undo/redo/restore-snapshot (unsafe with concurrent clients)');
-    console.error('  --timeout <sec>          Startup timeout (default: 300)');
-    console.error('  --no-run-auto-analysis   Skip auto-analysis on first open');
-    process.exit(1);
+try {
+  switch (cmd) {
+    case 'start':    await cmdStart(opts); break;
+    case 'stop':     await cmdStop(opts); break;
+    case 'stop-all': await cmdStopAll(opts); break;
+    case 'status':   await cmdStatus(opts); break;
+    default:
+      console.error('Usage: bridge.mjs <start|stop|stop-all|status> --binary <path> [options]');
+      console.error('');
+      console.error('Commands:');
+      console.error('  start     Start a worker for --binary (auto-imports + analyzes)');
+      console.error('  stop      Stop the worker and save the database');
+      console.error('  stop-all  Stop all running workers');
+      console.error('  status    Check if worker is running and get database info');
+      console.error('');
+      console.error('Options:');
+      console.error('  --binary <path>          Binary file to analyze');
+      console.error('  --idle <sec>             Idle auto-shutdown timeout (default: 600, 0=disable)');
+      console.error('  --autosave <sec>         Save this long after unsaved changes accumulate (default: 300, 0=disable)');
+      console.error('  --multi-agent            Block undo/redo/restore-snapshot (unsafe with concurrent clients)');
+      console.error('  --timeout <sec>          Start/save timeout (default: 300); also overrides the 30s stop wait');
+      console.error('  --no-run-auto-analysis   Skip auto-analysis on first open');
+      process.exit(1);
+  }
+} catch (error) {
+  console.error(`ERROR: ${error.message}`);
+  process.exitCode = 1;
 }
