@@ -18,7 +18,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from ida_cmd import Command, Param  # noqa: E402
+from ida_cmd import BUILTIN_COMMANDS, Command  # noqa: E402
 import handlers  # noqa: E402
 
 REF = SCRIPT_DIR.parent / "references" / "commands.md"
@@ -82,22 +82,8 @@ def github_anchor(title: str) -> str:
     return re.sub(r"[^\w -]", "", title.lower()).replace(" ", "-")
 
 
-# The four lifecycle built-ins are defined in the worker, not in a handler
-# module — include them here so the catalog is complete.
-LIFECYCLE = [
-    Command("open", None, "lifecycle", "Open a binary/database in the worker.",
-            params=[Param("file_path", "str", required=True, positional=True,
-                          help="Path to binary or .i64/.idb."),
-                    Param("run_auto_analysis", "bool", default=True, help="Run auto-analysis.")]),
-    Command("close", None, "lifecycle", "Close the current database.",
-            params=[Param("save", "bool", default=True, help="Save before closing.")]),
-    Command("save", None, "lifecycle", "Flush the database to disk."),
-    Command("list-commands", None, "lifecycle", "List all commands (worker-side)."),
-]
-
-
 def main() -> None:
-    by_cat: dict[str, list[Command]] = {"lifecycle": list(LIFECYCLE)}
+    by_cat: dict[str, list[Command]] = {"lifecycle": list(BUILTIN_COMMANDS)}
     for c in handlers.COMMANDS:
         by_cat.setdefault(c.category, []).append(c)
 

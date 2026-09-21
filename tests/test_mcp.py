@@ -70,7 +70,7 @@ class McpPortTests(unittest.TestCase):
 
         expected = {
             command.name.replace("-", "_")
-            for command in MCP._BUILTIN_SPECS + list(MCP.handlers.COMMANDS)
+            for command in MCP.BUILTIN_COMMANDS + list(MCP.handlers.COMMANDS)
         }
         self.assertEqual(expected, set(MCP.mcp.tools) - {"bridge_status"})
 

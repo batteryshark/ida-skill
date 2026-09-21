@@ -32,31 +32,15 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from ida_cmd import Command, Param  # noqa: E402
+from ida_cmd import BUILTIN_COMMANDS, Command, Param  # noqa: E402
 import handlers  # noqa: E402
 
 BIN_DIR = Path(os.environ.get("IDA_SKILL_BIN_DIR", SCRIPT_DIR.parent / "bin")).expanduser().resolve()
 RUNTIME_STATE = BIN_DIR / "runtime"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Built-in lifecycle commands — schema only (handled by the worker directly)
-# ─────────────────────────────────────────────────────────────────────────────
-_BUILTIN_SPECS = [
-    Command("open", None, "lifecycle", "Open a binary/database in the worker.",
-            params=[Param("file_path", "str", required=True, positional=True,
-                          help="Path to binary or .i64/.idb."),
-                    Param("run_auto_analysis", "bool", default=True,
-                          help="Run auto-analysis on open.")]),
-    Command("close", None, "lifecycle", "Close the current database.",
-            params=[Param("save", "bool", default=True, help="Save before closing.")]),
-    Command("save", None, "lifecycle", "Flush the database to disk."),
-    Command("list-commands", None, "lifecycle", "List all commands (worker-side)."),
-]
-
-
 def _all_commands() -> list[Command]:
-    return _BUILTIN_SPECS + list(handlers.COMMANDS)
+    return BUILTIN_COMMANDS + list(handlers.COMMANDS)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
